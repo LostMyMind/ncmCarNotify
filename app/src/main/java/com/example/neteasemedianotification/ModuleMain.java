@@ -5,10 +5,8 @@ import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
-import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
-import android.content.IntentFilter;
 import android.graphics.Bitmap;
 import android.media.MediaMetadata;
 import android.media.Rating;
@@ -20,7 +18,6 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
-import android.util.Log;
 
 import java.lang.reflect.Method;
 
@@ -31,7 +28,6 @@ import io.github.libxposed.api.XposedModuleInterface;
 public class ModuleMain extends XposedModule {
 
     private static final String TARGET_PACKAGE = "com.netease.cloudmusic.iot";
-    private static final String TAG = "[MediaNotifyHook]";
     private static final String CHANNEL_ID = "netease_media_playback";
     private static final int NOTIFICATION_ID = 10086;
     private static final String CUSTOM_ACTION_LIKE = "com.example.neteasemedianotification.TOGGLE_LIKE";
@@ -72,9 +68,6 @@ public class ModuleMain extends XposedModule {
         }
         
         instance = this;
-        
-        log(Log.INFO, TAG, "========== Hook Started ==========");
-        log(Log.INFO, TAG, "Package: " + param.getPackageName());
 
         try {
             Method attachMethod = Application.class.getDeclaredMethod("attach", Context.class);
@@ -88,7 +81,6 @@ public class ModuleMain extends XposedModule {
             hook(MediaSession.class.getDeclaredConstructor(Context.class, String.class, android.os.Bundle.class))
                 .intercept(new MediaSessionCtorHooker2());
 
-            // Hook setCallback to intercept custom actions
             Method setCallbackMethod = MediaSession.class.getDeclaredMethod("setCallback", MediaSession.Callback.class, Handler.class);
             hook(setCallbackMethod).intercept(new MediaSessionSetCallbackHooker());
 
@@ -100,10 +92,7 @@ public class ModuleMain extends XposedModule {
 
             Method setPlaybackStateMethod = MediaSession.class.getDeclaredMethod("setPlaybackState", PlaybackState.class);
             hook(setPlaybackStateMethod).intercept(new MediaSessionSetPlaybackStateHooker());
-
-            log(Log.INFO, TAG, "All hooks installed successfully");
-        } catch (Exception e) {
-            log(Log.INFO, TAG, "Hook installation failed: " + e.getMessage());
+        } catch (Exception ignored) {
         }
     }
 
@@ -113,7 +102,6 @@ public class ModuleMain extends XposedModule {
             appContext = (Context) chain.getArg(0);
             Object result = chain.proceed();
             initNotificationSystem();
-            log(Log.INFO, TAG, "Application.attach hooked");
             return result;
         }
     }
@@ -123,7 +111,6 @@ public class ModuleMain extends XposedModule {
         public Object intercept(XposedInterface.Chain chain) throws Throwable {
             Object result = chain.proceed();
             startMediaSessionMonitor();
-            log(Log.INFO, TAG, "Application.onCreate hooked");
             return result;
         }
     }
@@ -133,7 +120,6 @@ public class ModuleMain extends XposedModule {
         public Object intercept(XposedInterface.Chain chain) throws Throwable {
             chain.proceed();
             targetMediaSession = (MediaSession) chain.getThisObject();
-            log(Log.INFO, TAG, "MediaSession(1) created");
             return null;
         }
     }
@@ -143,7 +129,6 @@ public class ModuleMain extends XposedModule {
         public Object intercept(XposedInterface.Chain chain) throws Throwable {
             chain.proceed();
             targetMediaSession = (MediaSession) chain.getThisObject();
-            log(Log.INFO, TAG, "MediaSession(2) created");
             return null;
         }
     }
@@ -157,8 +142,6 @@ public class ModuleMain extends XposedModule {
             
             if (session == targetMediaSession && callback != null) {
                 originalCallback = callback;
-                log(Log.INFO, TAG, "MediaSession.setCallback hooked, wrapping callback");
-                // Replace with our wrapper
                 return chain.proceed(new Object[]{new LikeCallbackWrapper(), handler});
             }
             return chain.proceed();
@@ -168,7 +151,6 @@ public class ModuleMain extends XposedModule {
     public class LikeCallbackWrapper extends MediaSession.Callback {
         @Override
         public void onCustomAction(String action, Bundle extras) {
-            log(Log.INFO, TAG, "LikeCallbackWrapper.onCustomAction: " + action);
             if (CUSTOM_ACTION_LIKE.equals(action)) {
                 handleLikeAction();
             } else if (originalCallback != null) {
@@ -208,25 +190,23 @@ public class ModuleMain extends XposedModule {
 
         @Override
         public void onSetRating(Rating rating) {
-            log(Log.INFO, TAG, "LikeCallbackWrapper.onSetRating");
+            if (rating != null && rating.getRatingStyle() == Rating.RATING_HEART) {
+                isLiked = rating.hasHeart();
+                updatePlaybackStateAndNotification();
+            }
             if (originalCallback != null) originalCallback.onSetRating(rating);
         }
     }
 
     private void handleLikeAction() {
         try {
-            log(Log.INFO, TAG, "handleLikeAction called, isLiked=" + isLiked);
-            
             if (originalCallback != null) {
                 Rating rating = Rating.newHeartRating(!isLiked);
                 originalCallback.onSetRating(rating);
             }
-            
             isLiked = !isLiked;
             updatePlaybackStateAndNotification();
-            log(Log.INFO, TAG, "handleLikeAction completed: isLiked=" + isLiked);
-        } catch (Exception e) {
-            log(Log.INFO, TAG, "handleLikeAction error: " + e.getMessage());
+        } catch (Exception ignored) {
         }
     }
 
@@ -241,7 +221,6 @@ public class ModuleMain extends XposedModule {
             if (active && session == targetMediaSession) {
                 setupMediaController();
                 injectInitialPlaybackState();
-                log(Log.INFO, TAG, "MediaSession activated");
             } else if (!active) {
                 cancelNotification();
             }
@@ -259,9 +238,26 @@ public class ModuleMain extends XposedModule {
             
             if (metadata != null && session == targetMediaSession) {
                 updateMetadata(metadata);
+                checkLikeStatusFromMetadata(metadata);
                 updateNotification();
             }
             return null;
+        }
+    }
+
+    private void checkLikeStatusFromMetadata(MediaMetadata metadata) {
+        try {
+            Rating userRating = metadata.getRating(MediaMetadata.METADATA_KEY_USER_RATING);
+            if (userRating != null && userRating.getRatingStyle() == Rating.RATING_HEART) {
+                isLiked = userRating.hasHeart();
+                return;
+            }
+            
+            Rating rating = metadata.getRating(MediaMetadata.METADATA_KEY_RATING);
+            if (rating != null && rating.getRatingStyle() == Rating.RATING_HEART) {
+                isLiked = rating.hasHeart();
+            }
+        } catch (Exception ignored) {
         }
     }
 
@@ -272,6 +268,8 @@ public class ModuleMain extends XposedModule {
             PlaybackState originalState = (PlaybackState) chain.getArg(0);
             
             if (originalState != null && session == targetMediaSession) {
+                checkLikeStatusFromPlaybackState(originalState);
+                
                 PlaybackState modifiedState = injectPlaybackActions(originalState);
                 chain.proceed(new Object[]{modifiedState});
                 updatePlaybackState(modifiedState);
@@ -287,15 +285,34 @@ public class ModuleMain extends XposedModule {
         }
     }
 
+    private void checkLikeStatusFromPlaybackState(PlaybackState state) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            try {
+                Bundle extras = state.getExtras();
+                if (extras != null) {
+                    String[] likeKeys = {"liked", "is_liked", "favorite", "is_favorite", "like", "love"};
+                    for (String key : likeKeys) {
+                        if (extras.containsKey(key)) {
+                            Object val = extras.get(key);
+                            if (val instanceof Boolean) {
+                                isLiked = (Boolean) val;
+                                break;
+                            }
+                        }
+                    }
+                }
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
     private void injectInitialPlaybackState() {
         try {
             if (targetMediaSession == null) return;
             
             PlaybackState initialState = buildPlaybackState(PlaybackState.STATE_PAUSED, 0, 1.0f);
             targetMediaSession.setPlaybackState(initialState);
-            log(Log.INFO, TAG, "Injected initial PlaybackState");
-        } catch (Exception e) {
-            log(Log.INFO, TAG, "injectInitialPlaybackState error: " + e.getMessage());
+        } catch (Exception ignored) {
         }
     }
 
@@ -313,8 +330,7 @@ public class ModuleMain extends XposedModule {
                 targetMediaSession.setPlaybackState(newState);
             }
             updateNotification();
-        } catch (Exception e) {
-            log(Log.INFO, TAG, "updatePlaybackStateAndNotification error: " + e.getMessage());
+        } catch (Exception ignored) {
         }
     }
 
@@ -376,17 +392,17 @@ public class ModuleMain extends XposedModule {
                 channel.setLockscreenVisibility(Notification.VISIBILITY_PUBLIC);
                 notificationManager.createNotificationChannel(channel);
             }
-        } catch (Exception e) {
-            log(Log.INFO, TAG, "initNotificationSystem error: " + e.getMessage());
+        } catch (Exception ignored) {
         }
     }
 
     private void startMediaSessionMonitor() {
+        // Reduced frequency: check every 5 seconds instead of 2
         mainHandler.postDelayed(new Runnable() {
             @Override
             public void run() {
                 findActiveMediaSession();
-                mainHandler.postDelayed(this, 2000);
+                mainHandler.postDelayed(this, 5000);
             }
         }, 1000);
     }
@@ -404,7 +420,7 @@ public class ModuleMain extends XposedModule {
                     return;
                 }
             }
-        } catch (Exception e) {
+        } catch (Exception ignored) {
         }
     }
 
@@ -419,13 +435,18 @@ public class ModuleMain extends XposedModule {
                 MediaMetadata metadata = mediaController.getMetadata();
                 PlaybackState state = mediaController.getPlaybackState();
                 
-                if (metadata != null) updateMetadata(metadata);
-                if (state != null) updatePlaybackState(state);
+                if (metadata != null) {
+                    updateMetadata(metadata);
+                    checkLikeStatusFromMetadata(metadata);
+                }
+                if (state != null) {
+                    updatePlaybackState(state);
+                    checkLikeStatusFromPlaybackState(state);
+                }
                 
                 updateNotification();
             }
-        } catch (Exception e) {
-            log(Log.INFO, TAG, "setupMediaController error: " + e.getMessage());
+        } catch (Exception ignored) {
         }
     }
 
@@ -441,6 +462,7 @@ public class ModuleMain extends XposedModule {
             public void onMetadataChanged(MediaMetadata metadata) {
                 if (metadata != null) {
                     updateMetadata(metadata);
+                    checkLikeStatusFromMetadata(metadata);
                     updateNotification();
                 }
             }
@@ -449,6 +471,7 @@ public class ModuleMain extends XposedModule {
             public void onPlaybackStateChanged(PlaybackState state) {
                 if (state != null) {
                     updatePlaybackState(state);
+                    checkLikeStatusFromPlaybackState(state);
                     updateNotification();
                 }
             }
@@ -465,17 +488,19 @@ public class ModuleMain extends XposedModule {
     private void updateMetadata(MediaMetadata metadata) {
         try {
             String title = metadata.getString(MediaMetadata.METADATA_KEY_TITLE);
+            
             if (title != null && !title.equals(lastTitle)) {
                 lastTitle = title;
                 isLiked = false;
             }
+            
             String artist = metadata.getString(MediaMetadata.METADATA_KEY_ARTIST);
             Bitmap art = metadata.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART);
             
             if (title != null) currentTitle = title;
             if (artist != null) currentArtist = artist;
             if (art != null) currentAlbumArt = art;
-        } catch (Exception e) {
+        } catch (Exception ignored) {
         }
     }
 
@@ -507,7 +532,6 @@ public class ModuleMain extends XposedModule {
             }
             builder.setStyle(mediaStyle);
 
-            // Add actions (only for expanded view fallback)
             addMediaActions(builder);
 
             if (currentAlbumArt != null) {
@@ -525,15 +549,14 @@ public class ModuleMain extends XposedModule {
                         );
                         builder.setContentIntent(contentIntent);
                     }
-                } catch (Exception e) {
+                } catch (Exception ignored) {
                 }
             }
 
             Notification notification = builder.build();
             notificationManager.notify(NOTIFICATION_ID, notification);
 
-        } catch (Exception e) {
-            log(Log.INFO, TAG, "updateNotification error: " + e.getMessage());
+        } catch (Exception ignored) {
         }
     }
 
@@ -545,8 +568,7 @@ public class ModuleMain extends XposedModule {
             int playPauseIcon = isPlaying ? android.R.drawable.ic_media_pause : android.R.drawable.ic_media_play;
             builder.addAction(playPauseIcon, isPlaying ? "Pause" : "Play", createEmptyPendingIntent());
             builder.addAction(android.R.drawable.ic_media_next, "Next", createEmptyPendingIntent());
-        } catch (Exception e) {
-            log(Log.INFO, TAG, "addMediaActions error: " + e.getMessage());
+        } catch (Exception ignored) {
         }
     }
 
@@ -560,7 +582,7 @@ public class ModuleMain extends XposedModule {
             if (notificationManager != null) {
                 notificationManager.cancel(NOTIFICATION_ID);
             }
-        } catch (Exception e) {
+        } catch (Exception ignored) {
         }
     }
 }

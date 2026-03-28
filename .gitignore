@@ -1,0 +1,48 @@
+# ===== Gradle =====
+.gradle/
+build/
+**/build/
+
+# ===== Local config (敏感 & 机器相关) =====
+local.properties
+*.iml
+.idea/
+.DS_Store
+
+# ===== Android Studio / IntelliJ =====
+.idea/caches/
+.idea/libraries/
+.idea/modules.xml
+.idea/workspace.xml
+.idea/navEditor.xml
+.idea/assetWizardSettings.xml
+
+# ===== Keystore (签名文件，必须忽略) =====
+*.jks
+*.keystore
+
+# ===== Log / 临时文件 =====
+*.log
+*.tmp
+
+# ===== Generated files =====
+captures/
+.externalNativeBuild/
+.cxx/
+
+# ===== Kotlin / Java 编译 =====
+*.class
+out/
+
+# ===== APK / AAB 输出 =====
+*.apk
+*.ap_
+*.aab
+
+# ===== Proguard / R8 =====
+mapping.txt
+
+# ===== Xposed / LSPosed（可选）=====
+# 如果你有自己生成的配置或测试数据
+*.json
+额外资料/

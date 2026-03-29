@@ -40,6 +40,14 @@ public class ModuleMain extends XposedModule {
     private static final int NOTIFICATION_ID = 10086;
     private static final String CUSTOM_ACTION_LIKE = "com.example.neteasemedianotification.TOGGLE_LIKE";
     private static final String CUSTOM_ACTION_CLOSE = "com.example.neteasemedianotification.CLOSE";
+    private static final String ACTION_MEDIA_CONTROL = "com.example.neteasemedianotification.MEDIA_CONTROL";
+    private static final String EXTRA_CONTROL_ACTION = "control_action";
+    
+    private static final int REQUEST_PREV = 1;
+    private static final int REQUEST_PLAY_PAUSE = 2;
+    private static final int REQUEST_NEXT = 3;
+    private static final int REQUEST_LIKE = 4;
+    private static final int REQUEST_CLOSE = 5;
 
     private static final long SUPPORTED_ACTIONS =
         PlaybackState.ACTION_PLAY |
@@ -57,6 +65,7 @@ public class ModuleMain extends XposedModule {
     private NotificationManager notificationManager;
     private MediaSessionManager mediaSessionManager;
     private Handler mainHandler;
+    private android.content.BroadcastReceiver mediaControlReceiver;
     
     private MediaSession targetMediaSession;
     private MediaController mediaController;
@@ -790,54 +799,112 @@ public class ModuleMain extends XposedModule {
     }
 
     private void addMediaActions(Notification.Builder builder) {
-        Log.d(TAG, "添加媒体按钮, iconPrev=" + (iconPrev != null) + ", iconPlay=" + (iconPlay != null) + ", iconClose=" + (iconClose != null));
-        
         try {
+            // 注册 BroadcastReceiver（只注册一次）
+            registerMediaControlReceiver();
+            
             // Previous
+            PendingIntent prevPI = createControlPendingIntent("prev", REQUEST_PREV);
             if (iconPrev != null) {
-                builder.addAction(new Notification.Action.Builder(iconPrev, "Previous", createEmptyPendingIntent()).build());
+                builder.addAction(new Notification.Action.Builder(iconPrev, "Previous", prevPI).build());
             } else {
-                builder.addAction(android.R.drawable.ic_media_previous, "Previous", createEmptyPendingIntent());
+                builder.addAction(android.R.drawable.ic_media_previous, "Previous", prevPI);
             }
             
             // Play/Pause
+            PendingIntent playPausePI = createControlPendingIntent("playPause", REQUEST_PLAY_PAUSE);
             Icon playPauseIcon = isPlaying ? iconPause : iconPlay;
             if (playPauseIcon != null) {
-                builder.addAction(new Notification.Action.Builder(playPauseIcon, isPlaying ? "Pause" : "Play", createEmptyPendingIntent()).build());
+                builder.addAction(new Notification.Action.Builder(playPauseIcon, isPlaying ? "Pause" : "Play", playPausePI).build());
             } else {
                 int res = isPlaying ? android.R.drawable.ic_media_pause : android.R.drawable.ic_media_play;
-                builder.addAction(res, isPlaying ? "Pause" : "Play", createEmptyPendingIntent());
+                builder.addAction(res, isPlaying ? "Pause" : "Play", playPausePI);
             }
             
             // Next
+            PendingIntent nextPI = createControlPendingIntent("next", REQUEST_NEXT);
             if (iconNext != null) {
-                builder.addAction(new Notification.Action.Builder(iconNext, "Next", createEmptyPendingIntent()).build());
+                builder.addAction(new Notification.Action.Builder(iconNext, "Next", nextPI).build());
             } else {
-                builder.addAction(android.R.drawable.ic_media_next, "Next", createEmptyPendingIntent());
+                builder.addAction(android.R.drawable.ic_media_next, "Next", nextPI);
             }
             
-            // Like
+            // Like - 使用不同的 requestCode 确保状态更新
+            int likeRequestCode = REQUEST_LIKE + (isLiked ? 1000 : 0);
+            PendingIntent likePI = createControlPendingIntent("toggleLike", likeRequestCode);
             Icon likeIcon = isLiked ? iconLikeFilled : iconLikeBorder;
             if (likeIcon != null) {
-                builder.addAction(new Notification.Action.Builder(likeIcon, isLiked ? "Unlike" : "Like", createEmptyPendingIntent()).build());
+                builder.addAction(new Notification.Action.Builder(likeIcon, isLiked ? "Unlike" : "Like", likePI).build());
             } else {
                 int res = isLiked ? android.R.drawable.star_on : android.R.drawable.star_off;
-                builder.addAction(res, isLiked ? "Unlike" : "Like", createEmptyPendingIntent());
+                builder.addAction(res, isLiked ? "Unlike" : "Like", likePI);
             }
             
             // Close
+            PendingIntent closePI = createControlPendingIntent("close", REQUEST_CLOSE);
             if (iconClose != null) {
-                builder.addAction(new Notification.Action.Builder(iconClose, "Close", createEmptyPendingIntent()).build());
+                builder.addAction(new Notification.Action.Builder(iconClose, "Close", closePI).build());
             } else {
-                builder.addAction(android.R.drawable.ic_menu_close_clear_cancel, "Close", createEmptyPendingIntent());
+                builder.addAction(android.R.drawable.ic_menu_close_clear_cancel, "Close", closePI);
             }
-        } catch (Exception ignored) {
+        } catch (Exception e) {
+            Log.e(TAG, "addMediaActions error: " + e.getMessage());
         }
     }
 
-    private PendingIntent createEmptyPendingIntent() {
-        Intent intent = new Intent();
-        return PendingIntent.getActivity(appContext, 0, intent, PendingIntent.FLAG_IMMUTABLE);
+    private PendingIntent createControlPendingIntent(String action, int requestCode) {
+        Intent intent = new Intent(ACTION_MEDIA_CONTROL);
+        intent.putExtra(EXTRA_CONTROL_ACTION, action);
+        // Android 12+ 需要 FLAG_IMMUTABLE 或 FLAG_MUTABLE
+        int flags = PendingIntent.FLAG_UPDATE_CURRENT;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            flags |= PendingIntent.FLAG_IMMUTABLE;
+        }
+        return PendingIntent.getBroadcast(appContext, requestCode, intent, flags);
+    }
+    
+    private void registerMediaControlReceiver() {
+        if (mediaControlReceiver != null || appContext == null) return;
+        
+        mediaControlReceiver = new android.content.BroadcastReceiver() {
+            @Override
+            public void onReceive(android.content.Context context, android.content.Intent intent) {
+                String action = intent.getStringExtra(EXTRA_CONTROL_ACTION);
+                if (action == null) return;
+                
+                switch (action) {
+                    case "prev":
+                        if (originalCallback != null) originalCallback.onSkipToPrevious();
+                        break;
+                    case "playPause":
+                        if (originalCallback != null) {
+                            if (isPlaying) {
+                                originalCallback.onPause();
+                            } else {
+                                originalCallback.onPlay();
+                            }
+                        }
+                        break;
+                    case "next":
+                        if (originalCallback != null) originalCallback.onSkipToNext();
+                        break;
+                    case "toggleLike":
+                        handleLikeAction();
+                        break;
+                    case "close":
+                        handleCloseAction();
+                        break;
+                }
+            }
+        };
+        
+        android.content.IntentFilter filter = new android.content.IntentFilter(ACTION_MEDIA_CONTROL);
+        // Android 13+ 需要 RECEIVER_NOT_EXPORTED
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            appContext.registerReceiver(mediaControlReceiver, filter, android.content.Context.RECEIVER_NOT_EXPORTED);
+        } else {
+            appContext.registerReceiver(mediaControlReceiver, filter);
+        }
     }
 
     private void cancelNotification() {

@@ -11,7 +11,6 @@ import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
-import android.graphics.BitmapFactory;
 import android.graphics.Path;
 import android.graphics.drawable.Icon;
 import android.media.MediaMetadata;
@@ -69,7 +68,6 @@ public class ModuleMain extends XposedModule {
     private boolean isPlaying = false;
     private boolean isLiked = false;
     private String lastTitle = "";
-    private boolean isNotificationClosed = false; // 关闭按钮标志
     
     private Icon iconPrev = null;
     private Icon iconPlay = null;
@@ -119,41 +117,23 @@ public class ModuleMain extends XposedModule {
 
     private void initIcons() {
         if (iconsInitialized) {
+            Log.d(TAG, "图标已初始化，跳过");
             return;
         }
         
-        Log.d(TAG, "开始从 assets 加载图标");
+        Log.d(TAG, "开始初始化图标, appContext=" + (appContext != null));
         
-        iconPrev = loadIconFromAssets("icons/ic_prev.png");
-        iconPlay = loadIconFromAssets("icons/ic_play.png");
-        iconPause = loadIconFromAssets("icons/ic_pause.png");
-        iconNext = loadIconFromAssets("icons/ic_next.png");
-        iconLikeFilled = loadIconFromAssets("icons/ic_like_filled.png");
-        iconLikeBorder = loadIconFromAssets("icons/ic_like_border.png");
-        iconClose = loadIconFromAssets("icons/ic_close.png");
+        iconPrev = createIcon("M6 6h2v12H6V6zm3.5 6l8.5 6V6l-8.5 6z");
+        iconPlay = createIcon("M8 5v14l11-7L8 5z");
+        iconPause = createIcon("M6 19h4V5H6v14zm8-14v14h4V5h-4z");
+        iconNext = createIcon("M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z");
+        iconLikeFilled = createIcon("M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z");
+        iconLikeBorder = createIcon("M16.5 3c-1.74 0-3.41.81-4.5 2.09C10.91 3.81 9.24 3 7.5 3 4.42 3 2 5.42 2 8.5c0 3.78 3.4 6.86 8.55 11.54L12 21.35l1.45-1.32C18.6 15.36 22 12.28 22 8.5 22 5.42 19.58 3 16.5 3zm-4.4 15.55l-.1.1-.1-.1C7.14 14.24 4 11.39 4 8.5 4 6.5 5.5 5 7.5 5c1.54 0 3.04.99 3.57 2.36h1.87C13.46 5.99 14.96 5 16.5 5c2 0 3.5 1.5 3.5 3.5 0 2.89-3.14 5.74-7.9 10.05z");
+        iconClose = createIcon("M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12 19 6.41z");
         
-        Log.d(TAG, "图标加载结果: prev=" + (iconPrev != null) + ", play=" + (iconPlay != null) + ", close=" + (iconClose != null));
+        Log.d(TAG, "图标创建结果: prev=" + (iconPrev != null) + ", play=" + (iconPlay != null) + ", close=" + (iconClose != null));
         
         iconsInitialized = true;
-    }
-    
-    private Icon loadIconFromAssets(String filename) {
-        if (appContext == null) return null;
-        try {
-            // 获取模块自己的 Context 来访问 assets
-            Context moduleContext = appContext.createPackageContext(
-                "com.example.neteasemedianotification", 
-                Context.CONTEXT_IGNORE_SECURITY
-            );
-            android.content.res.AssetManager assets = moduleContext.getAssets();
-            android.graphics.Bitmap bitmap = BitmapFactory.decodeStream(assets.open(filename));
-            if (bitmap != null) {
-                return Icon.createWithBitmap(bitmap);
-            }
-        } catch (Exception e) {
-            Log.e(TAG, "loadIconFromAssets error: " + e.getMessage());
-        }
-        return null;
     }
     
     private Icon createIcon(String pathData) {
@@ -391,18 +371,11 @@ public class ModuleMain extends XposedModule {
 
     private void handleCloseAction() {
         try {
-            // 设置关闭标志，阻止通知重新加载
-            isNotificationClosed = true;
-            
-            // 先取消通知
-            cancelNotification();
-            
-            // 暂停播放
             if (originalCallback != null) {
                 originalCallback.onPause();
             }
-        } catch (Exception e) {
-            Log.e(TAG, "handleCloseAction error: " + e.getMessage());
+            cancelNotification();
+        } catch (Exception ignored) {
         }
     }
 
@@ -427,12 +400,9 @@ public class ModuleMain extends XposedModule {
             chain.proceed();
             
             if (active && session == targetMediaSession) {
-                // MediaSession 激活时重置关闭标志
-                isNotificationClosed = false;
                 setupMediaController();
                 injectInitialPlaybackState();
             } else if (!active) {
-                isNotificationClosed = true;
                 cancelNotification();
             }
             return null;
@@ -681,8 +651,6 @@ public class ModuleMain extends XposedModule {
             @Override
             public void onMetadataChanged(MediaMetadata metadata) {
                 if (metadata != null) {
-                    // 换歌时重置关闭标志，允许通知显示
-                    isNotificationClosed = false;
                     updateMetadata(metadata);
                     checkLikeStatusFromMetadata(metadata);
                     updateNotification();
@@ -731,12 +699,6 @@ public class ModuleMain extends XposedModule {
     }
 
     private void updateNotification() {
-        // 如果用户点了关闭按钮，不重新加载通知
-        if (isNotificationClosed) {
-            Log.d(TAG, "Notification closed by user, skip update");
-            return;
-        }
-        
         try {
             if (appContext == null || notificationManager == null) return;
             

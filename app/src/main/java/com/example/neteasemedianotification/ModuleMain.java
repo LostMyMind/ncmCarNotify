@@ -31,6 +31,7 @@ public class ModuleMain extends XposedModule {
     private static final String CHANNEL_ID = "netease_media_playback";
     private static final int NOTIFICATION_ID = 10086;
     private static final String CUSTOM_ACTION_LIKE = "com.example.neteasemedianotification.TOGGLE_LIKE";
+    private static final String CUSTOM_ACTION_CLOSE = "com.example.neteasemedianotification.CLOSE";
 
     private static final long SUPPORTED_ACTIONS =
         PlaybackState.ACTION_PLAY |
@@ -78,7 +79,7 @@ public class ModuleMain extends XposedModule {
 
             hook(MediaSession.class.getDeclaredConstructor(Context.class, String.class))
                 .intercept(new MediaSessionCtorHooker1());
-            hook(MediaSession.class.getDeclaredConstructor(Context.class, String.class, android.os.Bundle.class))
+            hook(MediaSession.class.getDeclaredConstructor(Context.class, String.class, Bundle.class))
                 .intercept(new MediaSessionCtorHooker2());
 
             Method setCallbackMethod = MediaSession.class.getDeclaredMethod("setCallback", MediaSession.Callback.class, Handler.class);
@@ -151,7 +152,9 @@ public class ModuleMain extends XposedModule {
     public class LikeCallbackWrapper extends MediaSession.Callback {
         @Override
         public void onCustomAction(String action, Bundle extras) {
-            if (CUSTOM_ACTION_LIKE.equals(action)) {
+            if (CUSTOM_ACTION_CLOSE.equals(action)) {
+                handleCloseAction();
+            } else if (CUSTOM_ACTION_LIKE.equals(action)) {
                 handleLikeAction();
             } else if (originalCallback != null) {
                 originalCallback.onCustomAction(action, extras);
@@ -195,6 +198,16 @@ public class ModuleMain extends XposedModule {
                 updatePlaybackStateAndNotification();
             }
             if (originalCallback != null) originalCallback.onSetRating(rating);
+        }
+    }
+
+    private void handleCloseAction() {
+        try {
+            if (originalCallback != null) {
+                originalCallback.onPause();
+            }
+            cancelNotification();
+        } catch (Exception ignored) {
         }
     }
 
@@ -346,6 +359,11 @@ public class ModuleMain extends XposedModule {
         ).build();
         builder.addCustomAction(likeAction);
         
+        PlaybackState.CustomAction closeAction = new PlaybackState.CustomAction.Builder(
+            CUSTOM_ACTION_CLOSE, "Close", android.R.drawable.ic_menu_close_clear_cancel
+        ).build();
+        builder.addCustomAction(closeAction);
+        
         return builder.build();
     }
 
@@ -370,6 +388,11 @@ public class ModuleMain extends XposedModule {
                 CUSTOM_ACTION_LIKE, likeLabel, likeIcon
             ).build();
             builder.addCustomAction(likeAction);
+            
+            PlaybackState.CustomAction closeAction = new PlaybackState.CustomAction.Builder(
+                CUSTOM_ACTION_CLOSE, "Close", android.R.drawable.ic_menu_close_clear_cancel
+            ).build();
+            builder.addCustomAction(closeAction);
             
             return builder.build();
         } catch (Exception e) {
@@ -397,7 +420,6 @@ public class ModuleMain extends XposedModule {
     }
 
     private void startMediaSessionMonitor() {
-        // Reduced frequency: check every 5 seconds instead of 2
         mainHandler.postDelayed(new Runnable() {
             @Override
             public void run() {
@@ -530,6 +552,7 @@ public class ModuleMain extends XposedModule {
             if (token != null) {
                 mediaStyle.setMediaSession(token);
             }
+            mediaStyle.setShowActionsInCompactView(0, 1, 2);
             builder.setStyle(mediaStyle);
 
             addMediaActions(builder);
@@ -562,12 +585,13 @@ public class ModuleMain extends XposedModule {
 
     private void addMediaActions(Notification.Builder builder) {
         try {
-            int likeIcon = isLiked ? android.R.drawable.star_on : android.R.drawable.star_off;
-            builder.addAction(likeIcon, isLiked ? "Unlike" : "Like", createEmptyPendingIntent());
             builder.addAction(android.R.drawable.ic_media_previous, "Previous", createEmptyPendingIntent());
             int playPauseIcon = isPlaying ? android.R.drawable.ic_media_pause : android.R.drawable.ic_media_play;
             builder.addAction(playPauseIcon, isPlaying ? "Pause" : "Play", createEmptyPendingIntent());
             builder.addAction(android.R.drawable.ic_media_next, "Next", createEmptyPendingIntent());
+            int likeIcon = isLiked ? android.R.drawable.star_on : android.R.drawable.star_off;
+            builder.addAction(likeIcon, isLiked ? "Unlike" : "Like", createEmptyPendingIntent());
+            builder.addAction(android.R.drawable.ic_menu_close_clear_cancel, "Close", createEmptyPendingIntent());
         } catch (Exception ignored) {
         }
     }
@@ -586,3 +610,5 @@ public class ModuleMain extends XposedModule {
         }
     }
 }
+
+

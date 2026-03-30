@@ -1,13 +1,23 @@
-# Add project specific ProGuard rules here.
-# You can control the set of applied configuration files using the
-# proguardFiles setting in build.gradle.
-#
-# For more details, see
-#   http://developer.android.com/guide/developing/tools/proguard.html
+# Xposed module ProGuard rules
 
-# Keep Xposed hook class
--keep class com.example.neteasemedianotification.MediaNotificationHook { *; }
+# Keep the main module class
+-keep class io.github.lostmymind.ncm.car.notify.ModuleMain { *; }
+
+# Keep Xposed interface (API 82)
 -keep class de.robv.android.xposed.** { *; }
+-keepclassmembers class * implements de.robv.android.xposed.IXposedHookLoadPackage {
+    public void handleLoadPackage(de.robv.android.xposed.callbacks.XC_LoadPackage$LoadPackageParam);
+}
 
-# Keep Android components
--keep class com.example.neteasemedianotification.MainActivity { *; }
+# Keep all inner classes
+-keep class io.github.lostmymind.ncm.car.notify.ModuleMain$* { *; }
+
+# Keep Android MediaSession related classes
+-keep class android.media.session.** { *; }
+-keep class android.media.MediaMetadata { *; }
+-keep class android.media.session.PlaybackState { *; }
+-keep class android.media.session.MediaSession { *; }
+-keep class android.media.session.MediaController { *; }
+
+# Keep BroadcastReceiver
+-keep class * extends android.content.BroadcastReceiver { *; }

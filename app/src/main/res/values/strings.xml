@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">Netease Media Notification</string>
+    <string name="app_name">网易云车机版通知控制</string>
     <string name="notification_channel_name">Media Playback Control</string>
     <string name="notification_channel_desc">Show music playback control notification</string>
 </resources>

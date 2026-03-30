@@ -8,11 +8,7 @@ import android.app.PendingIntent;
 import android.content.Context;
 import android.content.Intent;
 import android.graphics.Bitmap;
-import android.graphics.Canvas;
-import android.graphics.Color;
-import android.graphics.Paint;
 import android.graphics.BitmapFactory;
-import android.graphics.Path;
 import android.graphics.drawable.Icon;
 import android.media.MediaMetadata;
 import android.media.Rating;
@@ -28,11 +24,13 @@ import android.util.Log;
 
 import java.lang.reflect.Method;
 
-import io.github.libxposed.api.XposedInterface;
-import io.github.libxposed.api.XposedModule;
-import io.github.libxposed.api.XposedModuleInterface;
+import de.robv.android.xposed.IXposedHookLoadPackage;
+import de.robv.android.xposed.XC_MethodHook;
+import de.robv.android.xposed.XposedBridge;
+import de.robv.android.xposed.XposedHelpers;
+import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
-public class ModuleMain extends XposedModule {
+public class ModuleMain implements IXposedHookLoadPackage {
 
     private static final String TAG = "NeteaseMediaNotify";
     private static final String TARGET_PACKAGE = "com.netease.cloudmusic.iot";
@@ -78,7 +76,7 @@ public class ModuleMain extends XposedModule {
     private boolean isPlaying = false;
     private boolean isLiked = false;
     private String lastTitle = "";
-    private boolean isNotificationClosed = false; // 关闭按钮标志
+    private boolean isNotificationClosed = false;
     
     private Icon iconPrev = null;
     private Icon iconPlay = null;
@@ -90,8 +88,8 @@ public class ModuleMain extends XposedModule {
     private boolean iconsInitialized = false;
 
     @Override
-    public void onPackageLoaded(XposedModuleInterface.PackageLoadedParam param) {
-        if (!TARGET_PACKAGE.equals(param.getPackageName())) {
+    public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
+        if (!TARGET_PACKAGE.equals(lpparam.packageName)) {
             return;
         }
         
@@ -99,28 +97,114 @@ public class ModuleMain extends XposedModule {
         Log.d(TAG, "模块已加载，开始Hook");
 
         try {
-            Method attachMethod = Application.class.getDeclaredMethod("attach", Context.class);
-            hook(attachMethod).intercept(new ApplicationAttachHooker());
+            // Hook Application.attach
+            XposedHelpers.findAndHookMethod(Application.class, "attach", Context.class, new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    appContext = (Context) param.args[0];
+                    Log.d(TAG, "Application.attach 被调用");
+                    initIcons();
+                    initNotificationSystem();
+                }
+            });
 
-            Method onCreateMethod = Application.class.getDeclaredMethod("onCreate");
-            hook(onCreateMethod).intercept(new ApplicationOnCreateHooker());
+            // Hook Application.onCreate
+            XposedHelpers.findAndHookMethod(Application.class, "onCreate", new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    startMediaSessionMonitor();
+                }
+            });
 
-            hook(MediaSession.class.getDeclaredConstructor(Context.class, String.class))
-                .intercept(new MediaSessionCtorHooker1());
-            hook(MediaSession.class.getDeclaredConstructor(Context.class, String.class, Bundle.class))
-                .intercept(new MediaSessionCtorHooker2());
+            // Hook MediaSession 构造函数
+            XposedHelpers.findAndHookConstructor(MediaSession.class, Context.class, String.class, new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    targetMediaSession = (MediaSession) param.thisObject;
+                }
+            });
 
-            Method setCallbackMethod = MediaSession.class.getDeclaredMethod("setCallback", MediaSession.Callback.class, Handler.class);
-            hook(setCallbackMethod).intercept(new MediaSessionSetCallbackHooker());
+            XposedHelpers.findAndHookConstructor(MediaSession.class, Context.class, String.class, Bundle.class, new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    targetMediaSession = (MediaSession) param.thisObject;
+                }
+            });
 
-            Method setActiveMethod = MediaSession.class.getDeclaredMethod("setActive", boolean.class);
-            hook(setActiveMethod).intercept(new MediaSessionSetActiveHooker());
+            // Hook MediaSession.setCallback
+            XposedHelpers.findAndHookMethod(MediaSession.class, "setCallback", MediaSession.Callback.class, Handler.class, new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    MediaSession session = (MediaSession) param.thisObject;
+                    MediaSession.Callback callback = (MediaSession.Callback) param.args[0];
+                    Handler handler = (Handler) param.args[1];
+                    
+                    if (session == targetMediaSession && callback != null) {
+                        originalCallback = callback;
+                        param.args[0] = new LikeCallbackWrapper();
+                    }
+                }
+            });
 
-            Method setMetadataMethod = MediaSession.class.getDeclaredMethod("setMetadata", MediaMetadata.class);
-            hook(setMetadataMethod).intercept(new MediaSessionSetMetadataHooker());
+            // Hook MediaSession.setActive
+            XposedHelpers.findAndHookMethod(MediaSession.class, "setActive", boolean.class, new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    boolean active = (boolean) param.args[0];
+                    MediaSession session = (MediaSession) param.thisObject;
+                    
+                    if (active && session == targetMediaSession) {
+                        isNotificationClosed = false;
+                        setupMediaController();
+                        injectInitialPlaybackState();
+                    } else if (!active) {
+                        isNotificationClosed = true;
+                        cancelNotification();
+                    }
+                }
+            });
 
-            Method setPlaybackStateMethod = MediaSession.class.getDeclaredMethod("setPlaybackState", PlaybackState.class);
-            hook(setPlaybackStateMethod).intercept(new MediaSessionSetPlaybackStateHooker());
+            // Hook MediaSession.setMetadata
+            XposedHelpers.findAndHookMethod(MediaSession.class, "setMetadata", MediaMetadata.class, new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    MediaMetadata metadata = (MediaMetadata) param.args[0];
+                    MediaSession session = (MediaSession) param.thisObject;
+                    
+                    if (metadata != null && session == targetMediaSession) {
+                        updateMetadata(metadata);
+                        checkLikeStatusFromMetadata(metadata);
+                        updateNotification();
+                    }
+                }
+            });
+
+            // Hook MediaSession.setPlaybackState
+            XposedHelpers.findAndHookMethod(MediaSession.class, "setPlaybackState", PlaybackState.class, new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    MediaSession session = (MediaSession) param.thisObject;
+                    PlaybackState originalState = (PlaybackState) param.args[0];
+                    
+                    if (originalState != null && session == targetMediaSession) {
+                        checkLikeStatusFromPlaybackState(originalState);
+                        PlaybackState modifiedState = injectPlaybackActions(originalState);
+                        param.args[0] = modifiedState;
+                    }
+                }
+                
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    MediaSession session = (MediaSession) param.thisObject;
+                    PlaybackState state = (PlaybackState) param.args[0];
+                    
+                    if (state != null && session == targetMediaSession) {
+                        updatePlaybackState(state);
+                        updateNotification();
+                    }
+                }
+            });
+
         } catch (Exception e) {
             Log.e(TAG, "Hook失败: " + e.getMessage());
         }
@@ -149,13 +233,12 @@ public class ModuleMain extends XposedModule {
     private Icon loadIconFromAssets(String filename) {
         if (appContext == null) return null;
         try {
-            // 获取模块自己的 Context 来访问 assets
             Context moduleContext = appContext.createPackageContext(
                 "io.github.lostmymind.ncm.car.notify", 
                 Context.CONTEXT_IGNORE_SECURITY
             );
             android.content.res.AssetManager assets = moduleContext.getAssets();
-            android.graphics.Bitmap bitmap = BitmapFactory.decodeStream(assets.open(filename));
+            Bitmap bitmap = BitmapFactory.decodeStream(assets.open(filename));
             if (bitmap != null) {
                 return Icon.createWithBitmap(bitmap);
             }
@@ -163,187 +246,6 @@ public class ModuleMain extends XposedModule {
             Log.e(TAG, "loadIconFromAssets error: " + e.getMessage());
         }
         return null;
-    }
-    
-    private Icon createIcon(String pathData) {
-        if (appContext == null) {
-            Log.e(TAG, "createIcon失败: appContext为空");
-            return null;
-        }
-        
-        try {
-            float density = appContext.getResources().getDisplayMetrics().density;
-            int sizePx = (int) (24 * density);
-            if (sizePx <= 0) sizePx = 72;
-            
-            Log.d(TAG, "创建图标: sizePx=" + sizePx + ", density=" + density);
-            
-            Bitmap bitmap = Bitmap.createBitmap(sizePx, sizePx, Bitmap.Config.ARGB_8888);
-            if (bitmap == null) {
-                Log.e(TAG, "createIcon失败: Bitmap创建失败");
-                return null;
-            }
-            
-            Canvas canvas = new Canvas(bitmap);
-            Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
-            paint.setColor(Color.WHITE);
-            paint.setStyle(Paint.Style.FILL);
-            
-            Path path = parsePath(pathData);
-            if (path == null) {
-                Log.e(TAG, "createIcon失败: Path解析失败, pathData=" + pathData);
-                bitmap.recycle();
-                return null;
-            }
-            
-            float scale = sizePx / 24f;
-            canvas.scale(scale, scale);
-            canvas.drawPath(path, paint);
-            
-            Icon icon = Icon.createWithBitmap(bitmap);
-            if (icon == null) {
-                Log.e(TAG, "createIcon失败: Icon创建失败");
-                bitmap.recycle();
-                return null;
-            }
-            
-            Log.d(TAG, "图标创建成功");
-            return icon;
-        } catch (Throwable t) {
-            Log.e(TAG, "createIcon异常: " + t.getMessage());
-            return null;
-        }
-    }
-    
-    private Path parsePath(String d) {
-        if (d == null || d.isEmpty()) return null;
-        
-        Path path = new Path();
-        try {
-            // 在命令字母前插入空格，使split能正确工作
-            String normalized = d.replaceAll("([MmLlHhVvCcSsQqTtAaZz])", " $1 ");
-            String[] tokens = normalized.trim().split("[\\s,]+");
-            
-            Log.d(TAG, "parsePath: " + d + " -> tokens=" + tokens.length);
-            
-            float x = 0, y = 0;
-            float lastX = 0, lastY = 0;
-            
-            for (int i = 0; i < tokens.length; ) {
-                String cmd = tokens[i++];
-                if (cmd.isEmpty()) continue;
-                
-                switch (cmd) {
-                    case "M":
-                        x = Float.parseFloat(tokens[i++]);
-                        y = Float.parseFloat(tokens[i++]);
-                        path.moveTo(x, y);
-                        lastX = x; lastY = y;
-                        break;
-                    case "L":
-                        x = Float.parseFloat(tokens[i++]);
-                        y = Float.parseFloat(tokens[i++]);
-                        path.lineTo(x, y);
-                        lastX = x; lastY = y;
-                        break;
-                    case "H":
-                        x = Float.parseFloat(tokens[i++]);
-                        path.lineTo(x, lastY);
-                        lastX = x;
-                        break;
-                    case "V":
-                        y = Float.parseFloat(tokens[i++]);
-                        path.lineTo(lastX, y);
-                        lastY = y;
-                        break;
-                    case "C":
-                        float cx1 = Float.parseFloat(tokens[i++]);
-                        float cy1 = Float.parseFloat(tokens[i++]);
-                        float cx2 = Float.parseFloat(tokens[i++]);
-                        float cy2 = Float.parseFloat(tokens[i++]);
-                        x = Float.parseFloat(tokens[i++]);
-                        y = Float.parseFloat(tokens[i++]);
-                        path.cubicTo(cx1, cy1, cx2, cy2, x, y);
-                        lastX = x; lastY = y;
-                        break;
-                    case "Q":
-                        float qx = Float.parseFloat(tokens[i++]);
-                        float qy = Float.parseFloat(tokens[i++]);
-                        x = Float.parseFloat(tokens[i++]);
-                        y = Float.parseFloat(tokens[i++]);
-                        path.quadTo(qx, qy, x, y);
-                        lastX = x; lastY = y;
-                        break;
-                    case "Z":
-                    case "z":
-                        path.close();
-                        break;
-                    default:
-                        // 跳过未知命令
-                        break;
-                }
-            }
-            
-            Log.d(TAG, "Path解析成功");
-            return path;
-        } catch (Throwable t) {
-            Log.e(TAG, "parsePath异常: " + t.getMessage());
-            return null;
-        }
-    }
-
-    public class ApplicationAttachHooker implements XposedInterface.Hooker {
-        @Override
-        public Object intercept(XposedInterface.Chain chain) throws Throwable {
-            appContext = (Context) chain.getArg(0);
-            Log.d(TAG, "Application.attach 被调用, appContext=" + (appContext != null));
-            Object result = chain.proceed();
-            initIcons();
-            initNotificationSystem();
-            return result;
-        }
-    }
-
-    public class ApplicationOnCreateHooker implements XposedInterface.Hooker {
-        @Override
-        public Object intercept(XposedInterface.Chain chain) throws Throwable {
-            Object result = chain.proceed();
-            startMediaSessionMonitor();
-            return result;
-        }
-    }
-
-    public class MediaSessionCtorHooker1 implements XposedInterface.Hooker {
-        @Override
-        public Object intercept(XposedInterface.Chain chain) throws Throwable {
-            chain.proceed();
-            targetMediaSession = (MediaSession) chain.getThisObject();
-            return null;
-        }
-    }
-
-    public class MediaSessionCtorHooker2 implements XposedInterface.Hooker {
-        @Override
-        public Object intercept(XposedInterface.Chain chain) throws Throwable {
-            chain.proceed();
-            targetMediaSession = (MediaSession) chain.getThisObject();
-            return null;
-        }
-    }
-
-    public class MediaSessionSetCallbackHooker implements XposedInterface.Hooker {
-        @Override
-        public Object intercept(XposedInterface.Chain chain) throws Throwable {
-            MediaSession session = (MediaSession) chain.getThisObject();
-            MediaSession.Callback callback = (MediaSession.Callback) chain.getArg(0);
-            Handler handler = (Handler) chain.getArg(1);
-            
-            if (session == targetMediaSession && callback != null) {
-                originalCallback = callback;
-                return chain.proceed(new Object[]{new LikeCallbackWrapper(), handler});
-            }
-            return chain.proceed();
-        }
     }
 
     public class LikeCallbackWrapper extends MediaSession.Callback {
@@ -400,13 +302,8 @@ public class ModuleMain extends XposedModule {
 
     private void handleCloseAction() {
         try {
-            // 设置关闭标志，阻止通知重新加载
             isNotificationClosed = true;
-            
-            // 先取消通知
             cancelNotification();
-            
-            // 暂停播放
             if (originalCallback != null) {
                 originalCallback.onPause();
             }
@@ -427,44 +324,6 @@ public class ModuleMain extends XposedModule {
         }
     }
 
-    public class MediaSessionSetActiveHooker implements XposedInterface.Hooker {
-        @Override
-        public Object intercept(XposedInterface.Chain chain) throws Throwable {
-            boolean active = (boolean) chain.getArg(0);
-            MediaSession session = (MediaSession) chain.getThisObject();
-            
-            chain.proceed();
-            
-            if (active && session == targetMediaSession) {
-                // MediaSession 激活时重置关闭标志
-                isNotificationClosed = false;
-                setupMediaController();
-                injectInitialPlaybackState();
-            } else if (!active) {
-                isNotificationClosed = true;
-                cancelNotification();
-            }
-            return null;
-        }
-    }
-
-    public class MediaSessionSetMetadataHooker implements XposedInterface.Hooker {
-        @Override
-        public Object intercept(XposedInterface.Chain chain) throws Throwable {
-            MediaMetadata metadata = (MediaMetadata) chain.getArg(0);
-            MediaSession session = (MediaSession) chain.getThisObject();
-            
-            chain.proceed();
-            
-            if (metadata != null && session == targetMediaSession) {
-                updateMetadata(metadata);
-                checkLikeStatusFromMetadata(metadata);
-                updateNotification();
-            }
-            return null;
-        }
-    }
-
     private void checkLikeStatusFromMetadata(MediaMetadata metadata) {
         try {
             Rating userRating = metadata.getRating(MediaMetadata.METADATA_KEY_USER_RATING);
@@ -478,30 +337,6 @@ public class ModuleMain extends XposedModule {
                 isLiked = rating.hasHeart();
             }
         } catch (Exception ignored) {
-        }
-    }
-
-    public class MediaSessionSetPlaybackStateHooker implements XposedInterface.Hooker {
-        @Override
-        public Object intercept(XposedInterface.Chain chain) throws Throwable {
-            MediaSession session = (MediaSession) chain.getThisObject();
-            PlaybackState originalState = (PlaybackState) chain.getArg(0);
-            
-            if (originalState != null && session == targetMediaSession) {
-                checkLikeStatusFromPlaybackState(originalState);
-                
-                PlaybackState modifiedState = injectPlaybackActions(originalState);
-                chain.proceed(new Object[]{modifiedState});
-                updatePlaybackState(modifiedState);
-                updateNotification();
-            } else {
-                chain.proceed();
-                if (originalState != null && session == targetMediaSession) {
-                    updatePlaybackState(originalState);
-                    updateNotification();
-                }
-            }
-            return null;
         }
     }
 
@@ -690,7 +525,6 @@ public class ModuleMain extends XposedModule {
             @Override
             public void onMetadataChanged(MediaMetadata metadata) {
                 if (metadata != null) {
-                    // 换歌时重置关闭标志，允许通知显示
                     isNotificationClosed = false;
                     updateMetadata(metadata);
                     checkLikeStatusFromMetadata(metadata);
@@ -740,9 +574,7 @@ public class ModuleMain extends XposedModule {
     }
 
     private void updateNotification() {
-        // 如果用户点了关闭按钮，不重新加载通知
         if (isNotificationClosed) {
-            Log.d(TAG, "Notification closed by user, skip update");
             return;
         }
         
@@ -758,7 +590,7 @@ public class ModuleMain extends XposedModule {
                 .setSmallIcon(android.R.drawable.ic_media_play)
                 .setContentTitle(currentTitle)
                 .setContentText(currentArtist)
-                .setOngoing(true)
+                .setOngoing(isPlaying)
                 .setShowWhen(false)
                 .setVisibility(Notification.VISIBILITY_PUBLIC)
                 .setPriority(Notification.PRIORITY_LOW);
@@ -781,9 +613,12 @@ public class ModuleMain extends XposedModule {
                     String packageName = mediaController.getPackageName();
                     Intent launchIntent = appContext.getPackageManager().getLaunchIntentForPackage(packageName);
                     if (launchIntent != null) {
+                        int flags = PendingIntent.FLAG_UPDATE_CURRENT;
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                            flags |= PendingIntent.FLAG_IMMUTABLE;
+                        }
                         PendingIntent contentIntent = PendingIntent.getActivity(
-                            appContext, 0, launchIntent, 
-                            PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
+                            appContext, 0, launchIntent, flags
                         );
                         builder.setContentIntent(contentIntent);
                     }
@@ -791,16 +626,16 @@ public class ModuleMain extends XposedModule {
                 }
             }
 
-            Notification notification = builder.build();
-            notificationManager.notify(NOTIFICATION_ID, notification);
+            notificationManager.notify(NOTIFICATION_ID, builder.build());
 
-        } catch (Exception ignored) {
+        } catch (Exception e) {
+            Log.e(TAG, "updateNotification error: " + e.getMessage());
         }
     }
 
+    @android.annotation.SuppressLint("UnspecifiedRegisterReceiverFlag")
     private void addMediaActions(Notification.Builder builder) {
         try {
-            // 注册 BroadcastReceiver（只注册一次）
             registerMediaControlReceiver();
             
             // Previous
@@ -829,7 +664,7 @@ public class ModuleMain extends XposedModule {
                 builder.addAction(android.R.drawable.ic_media_next, "Next", nextPI);
             }
             
-            // Like - 使用不同的 requestCode 确保状态更新
+            // Like
             int likeRequestCode = REQUEST_LIKE + (isLiked ? 1000 : 0);
             PendingIntent likePI = createControlPendingIntent("toggleLike", likeRequestCode);
             Icon likeIcon = isLiked ? iconLikeFilled : iconLikeBorder;
@@ -855,7 +690,6 @@ public class ModuleMain extends XposedModule {
     private PendingIntent createControlPendingIntent(String action, int requestCode) {
         Intent intent = new Intent(ACTION_MEDIA_CONTROL);
         intent.putExtra(EXTRA_CONTROL_ACTION, action);
-        // Android 12+ 需要 FLAG_IMMUTABLE 或 FLAG_MUTABLE
         int flags = PendingIntent.FLAG_UPDATE_CURRENT;
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             flags |= PendingIntent.FLAG_IMMUTABLE;
@@ -863,7 +697,6 @@ public class ModuleMain extends XposedModule {
         return PendingIntent.getBroadcast(appContext, requestCode, intent, flags);
     }
     
-    @android.annotation.SuppressLint("UnspecifiedRegisterReceiverFlag")
     private void registerMediaControlReceiver() {
         if (mediaControlReceiver != null || appContext == null) return;
         
@@ -900,7 +733,6 @@ public class ModuleMain extends XposedModule {
         };
         
         android.content.IntentFilter filter = new android.content.IntentFilter(ACTION_MEDIA_CONTROL);
-        // Android 13+ 需要 RECEIVER_NOT_EXPORTED
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             appContext.registerReceiver(mediaControlReceiver, filter, android.content.Context.RECEIVER_NOT_EXPORTED);
         } else {
@@ -909,11 +741,8 @@ public class ModuleMain extends XposedModule {
     }
 
     private void cancelNotification() {
-        try {
-            if (notificationManager != null) {
-                notificationManager.cancel(NOTIFICATION_ID);
-            }
-        } catch (Exception ignored) {
+        if (notificationManager != null) {
+            notificationManager.cancel(NOTIFICATION_ID);
         }
     }
 }

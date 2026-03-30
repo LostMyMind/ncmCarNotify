@@ -3,11 +3,11 @@ plugins {
 }
 
 android {
-    namespace 'com.example.neteasemedianotification'
+    namespace 'io.github.lostmymind.ncm.car.notify'
     compileSdk 34
 
     defaultConfig {
-        applicationId "com.example.neteasemedianotification"
+        applicationId "io.github.lostmymind.ncm.car.notify"
         minSdk 26
         targetSdk 34
         versionCode 1

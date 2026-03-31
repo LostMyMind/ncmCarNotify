@@ -3,21 +3,11 @@
 # Keep the main module class
 -keep class io.github.lostmymind.ncm.car.notify.ModuleMain { *; }
 
-# Keep Xposed interface (API 82)
--keep class de.robv.android.xposed.** { *; }
--keepclassmembers class * implements de.robv.android.xposed.IXposedHookLoadPackage {
-    public void handleLoadPackage(de.robv.android.xposed.callbacks.XC_LoadPackage$LoadPackageParam);
-}
-
-# Keep all inner classes
+# Keep all inner Hooker classes
 -keep class io.github.lostmymind.ncm.car.notify.ModuleMain$* { *; }
 
-# Keep Android MediaSession related classes
--keep class android.media.session.** { *; }
--keep class android.media.MediaMetadata { *; }
--keep class android.media.session.PlaybackState { *; }
--keep class android.media.session.MediaSession { *; }
--keep class android.media.session.MediaController { *; }
+# Keep libxposed API classes
+-keep class io.github.libxposed.api.** { *; }
 
-# Keep BroadcastReceiver
--keep class * extends android.content.BroadcastReceiver { *; }
+# Keep all classes with XposedHooker annotation
+-keep @io.github.libxposed.api.annotations.XposedHooker class * { *; }

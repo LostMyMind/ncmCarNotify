@@ -10,6 +10,9 @@ import android.content.Intent;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.drawable.Icon;
+import android.media.AudioDeviceCallback;
+import android.media.AudioDeviceInfo;
+import android.media.AudioManager;
 import android.media.MediaMetadata;
 import android.media.Rating;
 import android.media.session.MediaController;
@@ -77,6 +80,11 @@ public class ModuleMain implements IXposedHookLoadPackage {
     private boolean isLiked = false;
     private String lastTitle = "";
     private boolean isNotificationClosed = false;
+    
+    // 音频设备检测
+    private AudioManager audioManager;
+    private boolean hasPrivateAudioDevice = false;
+    private boolean audioDeviceCallbackRegistered = false;
     
     private Icon iconPrev = null;
     private Icon iconPlay = null;
@@ -446,7 +454,11 @@ public class ModuleMain implements IXposedHookLoadPackage {
         try {
             notificationManager = (NotificationManager) appContext.getSystemService(Context.NOTIFICATION_SERVICE);
             mediaSessionManager = (MediaSessionManager) appContext.getSystemService(Context.MEDIA_SESSION_SERVICE);
+            audioManager = (AudioManager) appContext.getSystemService(Context.AUDIO_SERVICE);
             mainHandler = new Handler(Looper.getMainLooper());
+            
+            // 注册音频设备回调
+            registerAudioDeviceCallback();
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 NotificationChannel channel = new NotificationChannel(
@@ -743,6 +755,90 @@ public class ModuleMain implements IXposedHookLoadPackage {
     private void cancelNotification() {
         if (notificationManager != null) {
             notificationManager.cancel(NOTIFICATION_ID);
+        }
+    }
+    
+    // ===== 音频设备检测功能 =====
+    
+    private void registerAudioDeviceCallback() {
+        if (audioDeviceCallbackRegistered || audioManager == null) return;
+        
+        // 检查当前音频设备状态
+        checkPrivateAudioDevice();
+        
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            audioManager.registerAudioDeviceCallback(new AudioDeviceCallback() {
+                @Override
+                public void onAudioDevicesAdded(AudioDeviceInfo[] addedDevices) {
+                    checkPrivateAudioDevice();
+                }
+                
+                @Override
+                public void onAudioDevicesRemoved(AudioDeviceInfo[] removedDevices) {
+                    boolean hadPrivate = hasPrivateAudioDevice;
+                    checkPrivateAudioDevice();
+                    
+                    // 如果之前有私密设备，现在没有了，且正在播放，则暂停
+                    if (hadPrivate && !hasPrivateAudioDevice && isPlaying) {
+                        Log.d(TAG, "Private audio device removed, pausing playback");
+                        pausePlayback();
+                    }
+                }
+            }, mainHandler);
+            
+            audioDeviceCallbackRegistered = true;
+            Log.d(TAG, "AudioDeviceCallback registered");
+        }
+    }
+    
+    private void checkPrivateAudioDevice() {
+        if (audioManager == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
+            hasPrivateAudioDevice = true; // 默认认为有私密设备
+            return;
+        }
+        
+        AudioDeviceInfo[] devices = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS);
+        hasPrivateAudioDevice = false;
+        
+        for (AudioDeviceInfo device : devices) {
+            if (isPrivateAudioDevice(device.getType())) {
+                hasPrivateAudioDevice = true;
+                Log.d(TAG, "Found private audio device: type=" + device.getType());
+                break;
+            }
+        }
+        
+        Log.d(TAG, "Private audio device status: " + hasPrivateAudioDevice);
+    }
+    
+    private boolean isPrivateAudioDevice(int type) {
+        // 私密音频设备类型
+        switch (type) {
+            case AudioDeviceInfo.TYPE_WIRED_HEADSET:      // 3 - 有线耳机(带麦克风)
+            case AudioDeviceInfo.TYPE_WIRED_HEADPHONES:   // 11 - 有线耳机(无麦克风)
+            case AudioDeviceInfo.TYPE_BLUETOOTH_A2DP:     // 7 - 蓝牙A2DP
+            case AudioDeviceInfo.TYPE_BLUETOOTH_SCO:      // 6 - 蓝牙SCO
+            case AudioDeviceInfo.TYPE_USB_HEADSET:        // 22 - USB耳机
+            case AudioDeviceInfo.TYPE_USB_DEVICE:         // 18 - USB设备
+            case AudioDeviceInfo.TYPE_HEARING_AID:        // 23 - 助听器
+            case AudioDeviceInfo.TYPE_DOCK:               // 13 - 底座
+            case AudioDeviceInfo.TYPE_LINE_ANALOG:        // 19 - 模拟线路
+            case AudioDeviceInfo.TYPE_HDMI:               // 9 - HDMI
+            case AudioDeviceInfo.TYPE_AUX_LINE:           // 20 - AUX线路
+            case AudioDeviceInfo.TYPE_USB_ACCESSORY:      // 17 - USB配件
+                return true;
+            default:
+                return false;
+        }
+    }
+    
+    private void pausePlayback() {
+        try {
+            if (originalCallback != null) {
+                originalCallback.onPause();
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "pausePlayback error: " + e.getMessage());
         }
     }
 }

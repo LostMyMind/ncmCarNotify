@@ -80,6 +80,8 @@ public class ModuleMain extends XposedModule {
     private Runnable debounceRunnable;
     private Runnable likeVerifyRunnable;
     private long lastLikeVerifyTime = 0;
+    private long lastLocalLikeUpdateTime = 0;  // 鏈湴鏀惰棌鐘舵€佹洿鏂版椂闂?
+    private static final long LOCAL_STATE_PRIORITY_MS = 2000;  // 鏈湴鐘舵€佷紭鍏堟椂闂寸獥鍙?
     private long lastPlaybackStateUpdateTime = 0;
     private boolean hasPrivateAudioDevice = false;
     private boolean audioDeviceCallbackRegistered = false;
@@ -200,7 +202,10 @@ public class ModuleMain extends XposedModule {
         public void onSetRating(Rating rating) {
             if (rating != null && rating.getRatingStyle() == Rating.RATING_HEART) {
                 long now = System.currentTimeMillis();
-                if (now - lastLikeVerifyTime > LIKE_COOLDOWN_MS) {
+                // 鏈湴鐘舵€佷紭鍏堬細鍦ㄦ湰鍦板垰淇敼鏀惰棌鐘舵€佸悗锛屽拷鐣ョ郴缁熷洖鍐?
+                if (now - lastLocalLikeUpdateTime < LOCAL_STATE_PRIORITY_MS) {
+                    logDebug("Local like state priority in callback, skip system update");
+                } else if (now - lastLikeVerifyTime > LIKE_COOLDOWN_MS) {
                     isLiked = rating.hasHeart();
                     scheduleDebouncedUpdate();
                 }
@@ -396,7 +401,7 @@ public class ModuleMain extends XposedModule {
                 lastLikeVerifyTime = 0;
                 logDebug("Song changed, reset like status");
             }
-            // 从 metadata 检测收藏状态
+            // 浠?metadata 妫€娴嬫敹钘忕姸鎬?
             checkLikeStatusFromMetadata(metadata);
             if (newTitle != null) currentTitle = newTitle;
             currentArtist = newArtist;
@@ -407,14 +412,21 @@ public class ModuleMain extends XposedModule {
 
     private void checkLikeStatusFromMetadata(MediaMetadata metadata) {
         try {
-            // 优先检查 USER_RATING
+            // 鏈湴鐘舵€佷紭鍏堬細鍦ㄦ湰鍦板垰淇敼鏀惰棌鐘舵€佸悗鐨勪竴娈垫椂闂村唴锛屽拷鐣ョ郴缁熷洖鍐?
+            long now = System.currentTimeMillis();
+            if (now - lastLocalLikeUpdateTime < LOCAL_STATE_PRIORITY_MS) {
+                logDebug("Local like state priority, skip system callback");
+                return;
+            }
+
+            // 浼樺厛妫€鏌?USER_RATING
             Rating userRating = metadata.getRating(MediaMetadata.METADATA_KEY_USER_RATING);
             if (userRating != null && userRating.getRatingStyle() == Rating.RATING_HEART) {
                 isLiked = userRating.hasHeart();
                 logDebug("Like status from USER_RATING: " + isLiked);
                 return;
             }
-            // 回退检查 RATING
+            // 鍥為€€妫€鏌?RATING
             Rating rating = metadata.getRating(MediaMetadata.METADATA_KEY_RATING);
             if (rating != null && rating.getRatingStyle() == Rating.RATING_HEART) {
                 isLiked = rating.hasHeart();
@@ -512,6 +524,7 @@ public class ModuleMain extends XposedModule {
         else builder.addAction(android.R.drawable.ic_menu_close_clear_cancel, "Close", cachedClosePI);
     }
 
+    @SuppressLint("UnspecifiedRegisterReceiverFlag")
     private void registerMediaControlReceiver() {
         if (mediaControlReceiver != null || appContext == null) return;
         mediaControlReceiver = new android.content.BroadcastReceiver() {
@@ -529,82 +542,43 @@ public class ModuleMain extends XposedModule {
             }
         };
         android.content.IntentFilter filter = new android.content.IntentFilter(ACTION_MEDIA_CONTROL);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) appContext.registerReceiver(mediaControlReceiver, filter, android.content.Context.RECEIVER_NOT_EXPORTED);
-        else appContext.registerReceiver(mediaControlReceiver, filter);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            appContext.registerReceiver(mediaControlReceiver, filter, android.content.Context.RECEIVER_NOT_EXPORTED);
+        } else {
+            appContext.registerReceiver(mediaControlReceiver, filter);
+        }
     }
 
     private void handleLikeAction() {
         try {
-            boolean newLikedState = !isLiked;
-            isLiked = newLikedState;
-            lastLikeVerifyTime = System.currentTimeMillis();
-            updateLikePendingIntent();
-
-            logDebug("Optimistic like update: " + newLikedState);
-
-            // 收藏按钮专用刷新通道：主线程立即强制刷新
-            forceRefreshNotification();
-
+            // 先通知网易云
             if (originalCallback != null) {
-                Rating rating = Rating.newHeartRating(newLikedState);
+                Rating rating = Rating.newHeartRating(!isLiked);
                 originalCallback.onSetRating(rating);
             }
-
-            scheduleLikeVerification(newLikedState);
+            // 更新本地状态
+            isLiked = !isLiked;
+            lastIsLiked = isLiked;
+            
+            // 关键：更新 PlaybackState 来触发刷新
+            updatePlaybackStateAndNotification();
         } catch (Exception e) { logError("handleLikeAction error: " + e.getMessage()); }
     }
 
-    // 收藏按钮专用：强制立即刷新通知，绕过所有防抖和状态检查
-    private void forceRefreshNotification() {
-        if (mainHandler == null) return;
-        // 确保在主线程执行
-        mainHandler.post(new Runnable() {
-            @Override
-            public void run() {
-                try {
-                    if (appContext == null || notificationManager == null) return;
-                    if (isNotificationClosed) {
-                        isNotificationClosed = false;
-                    }
-
-                    MediaSession.Token token = targetMediaSession != null ? targetMediaSession.getSessionToken() : null;
-                    Notification.Builder builder = new Notification.Builder(appContext, CHANNEL_ID)
-                        .setSmallIcon(android.R.drawable.ic_media_play)
-                        .setContentTitle(currentTitle)
-                        .setContentText(currentArtist)
-                        .setOngoing(isPlaying)
-                        .setShowWhen(false)
-                        .setVisibility(Notification.VISIBILITY_PUBLIC)
-                        .setPriority(Notification.PRIORITY_LOW);
-
-                    Notification.MediaStyle mediaStyle = new Notification.MediaStyle();
-                    if (token != null) mediaStyle.setMediaSession(token);
-                    mediaStyle.setShowActionsInCompactView(0, 1, 2);
-                    builder.setStyle(mediaStyle);
-
-                    addMediaActions(builder);
-
-                    if (currentAlbumArt != null) builder.setLargeIcon(currentAlbumArt);
-
-                    if (mediaController != null) {
-                        try {
-                            String packageName = mediaController.getPackageName();
-                            Intent launchIntent = appContext.getPackageManager().getLaunchIntentForPackage(packageName);
-                            if (launchIntent != null) {
-                                int flags = PendingIntent.FLAG_UPDATE_CURRENT;
-                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) flags |= PendingIntent.FLAG_IMMUTABLE;
-                                PendingIntent contentIntent = PendingIntent.getActivity(appContext, 0, launchIntent, flags);
-                                builder.setContentIntent(contentIntent);
-                            }
-                        } catch (Exception ignored) {}
-                    }
-
-                    // 使用相同ID强制更新
-                    notificationManager.notify(NOTIFICATION_ID, builder.build());
-                    logDebug("Notification force refreshed for like action");
-                } catch (Exception e) { logError("forceRefreshNotification error: " + e.getMessage()); }
+    private void updatePlaybackStateAndNotification() {
+        try {
+            if (targetMediaSession == null || mediaController == null) return;
+            PlaybackState currentState = mediaController.getPlaybackState();
+            if (currentState != null) {
+                PlaybackState newState = buildPlaybackState(
+                    currentState.getState(),
+                    Math.max(0, currentState.getPosition()),
+                    currentState.getPlaybackSpeed()
+                );
+                targetMediaSession.setPlaybackState(newState);
             }
-        });
+            updateNotificationInternal();
+        } catch (Exception e) { logError("updatePlaybackStateAndNotification error: " + e.getMessage()); }
     }
 
     private void scheduleLikeVerification(final boolean expectedState) {
@@ -614,13 +588,16 @@ public class ModuleMain extends XposedModule {
             @Override
             public void run() {
                 if (isLiked != expectedState) {
-                    logDebug("Like state mismatch, updating notification");
+                    logDebug("Like state mismatch after priority window, updating");
+                    isLiked = expectedState;
+                    lastIsLiked = isLiked;
                     updateLikePendingIntent();
-                    scheduleDebouncedUpdate();
-                } else { logDebug("Like state verified: " + expectedState); }
+                    updateNotificationInternal();
+                    logDebug("Like state verified: " + expectedState);
+                }
             }
         };
-        mainHandler.postDelayed(likeVerifyRunnable, LIKE_VERIFY_DELAY_MS);
+        mainHandler.postDelayed(likeVerifyRunnable, LOCAL_STATE_PRIORITY_MS + 100);
     }
 
     private void handleCloseAction() {

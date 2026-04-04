@@ -9,7 +9,6 @@ import android.app.PendingIntent;
 import android.content.Context;
 import android.content.Intent;
 import android.graphics.Bitmap;
-import android.graphics.BitmapFactory;
 import android.graphics.drawable.Icon;
 import android.media.AudioDeviceCallback;
 import android.media.AudioDeviceInfo;
@@ -274,26 +273,28 @@ public class ModuleMain extends XposedModule {
 
     private void initIcons() {
         if (iconsInitialized) return;
-        logDebug("Loading icons from assets");
-        iconPrev = loadIconFromAssets("icons/ic_prev.png");
-        iconPlay = loadIconFromAssets("icons/ic_play.png");
-        iconPause = loadIconFromAssets("icons/ic_pause.png");
-        iconNext = loadIconFromAssets("icons/ic_next.png");
-        iconLikeFilled = loadIconFromAssets("icons/ic_like_filled.png");
-        iconLikeBorder = loadIconFromAssets("icons/ic_like_border.png");
-        iconClose = loadIconFromAssets("icons/ic_close.png");
+        logDebug("Loading icons from drawable resources");
+        try {
+            Context moduleContext = appContext.createPackageContext("io.github.lostmymind.ncm.car.notify", Context.CONTEXT_IGNORE_SECURITY);
+            int prevId = moduleContext.getResources().getIdentifier("ic_skip_previous", "drawable", "io.github.lostmymind.ncm.car.notify");
+            int playId = moduleContext.getResources().getIdentifier("ic_play", "drawable", "io.github.lostmymind.ncm.car.notify");
+            int pauseId = moduleContext.getResources().getIdentifier("ic_pause", "drawable", "io.github.lostmymind.ncm.car.notify");
+            int nextId = moduleContext.getResources().getIdentifier("ic_skip_next", "drawable", "io.github.lostmymind.ncm.car.notify");
+            int likeFilledId = moduleContext.getResources().getIdentifier("ic_favorite", "drawable", "io.github.lostmymind.ncm.car.notify");
+            int likeBorderId = moduleContext.getResources().getIdentifier("ic_favorite_border", "drawable", "io.github.lostmymind.ncm.car.notify");
+            int closeId = moduleContext.getResources().getIdentifier("ic_close", "drawable", "io.github.lostmymind.ncm.car.notify");
+            if (prevId != 0) iconPrev = Icon.createWithResource(moduleContext, prevId);
+            if (playId != 0) iconPlay = Icon.createWithResource(moduleContext, playId);
+            if (pauseId != 0) iconPause = Icon.createWithResource(moduleContext, pauseId);
+            if (nextId != 0) iconNext = Icon.createWithResource(moduleContext, nextId);
+            if (likeFilledId != 0) iconLikeFilled = Icon.createWithResource(moduleContext, likeFilledId);
+            if (likeBorderId != 0) iconLikeBorder = Icon.createWithResource(moduleContext, likeBorderId);
+            if (closeId != 0) iconClose = Icon.createWithResource(moduleContext, closeId);
+        } catch (Exception e) { logError("initIcons error: " + e.getMessage()); }
         iconsInitialized = true;
     }
 
-    private Icon loadIconFromAssets(String filename) {
-        if (appContext == null) return null;
-        try {
-            Context moduleContext = appContext.createPackageContext("io.github.lostmymind.ncm.car.notify", Context.CONTEXT_IGNORE_SECURITY);
-            Bitmap bitmap = BitmapFactory.decodeStream(moduleContext.getAssets().open(filename));
-            if (bitmap != null) return Icon.createWithBitmap(bitmap);
-        } catch (Exception e) { logError("loadIconFromAssets error: " + e.getMessage()); }
-        return null;
-    }
+
 
     private void initPendingIntents() {
         if (pendingIntentsInitialized || appContext == null) return;

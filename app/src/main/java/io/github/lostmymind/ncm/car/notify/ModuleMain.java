@@ -1,5 +1,6 @@
 package io.github.lostmymind.ncm.car.notify;
 
+import android.annotation.SuppressLint;
 import android.app.Application;
 import android.app.Notification;
 import android.app.NotificationChannel;
@@ -10,6 +11,9 @@ import android.content.Intent;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.drawable.Icon;
+import android.media.AudioDeviceCallback;
+import android.media.AudioDeviceInfo;
+import android.media.AudioManager;
 import android.media.MediaMetadata;
 import android.media.Rating;
 import android.media.session.MediaController;
@@ -20,17 +24,16 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
-import android.util.Log;
 
 import java.lang.reflect.Method;
+import java.util.HashSet;
+import java.util.Set;
 
-import de.robv.android.xposed.IXposedHookLoadPackage;
-import de.robv.android.xposed.XC_MethodHook;
-import de.robv.android.xposed.XposedBridge;
-import de.robv.android.xposed.XposedHelpers;
-import de.robv.android.xposed.callbacks.XC_LoadPackage;
+import io.github.libxposed.api.XposedInterface;
+import io.github.libxposed.api.XposedModule;
+import io.github.libxposed.api.XposedModuleInterface;
 
-public class ModuleMain implements IXposedHookLoadPackage {
+public class ModuleMain extends XposedModule {
 
     private static final String TAG = "NeteaseMediaNotify";
     private static final String TARGET_PACKAGE = "com.netease.cloudmusic.iot";
@@ -40,44 +43,44 @@ public class ModuleMain implements IXposedHookLoadPackage {
     private static final String CUSTOM_ACTION_CLOSE = "io.github.lostmymind.ncm.car.notify.CLOSE";
     private static final String ACTION_MEDIA_CONTROL = "io.github.lostmymind.ncm.car.notify.MEDIA_CONTROL";
     private static final String EXTRA_CONTROL_ACTION = "control_action";
-    
     private static final int REQUEST_PREV = 1;
     private static final int REQUEST_PLAY_PAUSE = 2;
     private static final int REQUEST_NEXT = 3;
     private static final int REQUEST_LIKE = 4;
     private static final int REQUEST_CLOSE = 5;
-
-    private static final long SUPPORTED_ACTIONS =
-        PlaybackState.ACTION_PLAY |
-        PlaybackState.ACTION_PAUSE |
-        PlaybackState.ACTION_PLAY_PAUSE |
-        PlaybackState.ACTION_SKIP_TO_PREVIOUS |
-        PlaybackState.ACTION_SKIP_TO_NEXT |
-        PlaybackState.ACTION_STOP |
-        PlaybackState.ACTION_SEEK_TO |
-        PlaybackState.ACTION_SET_RATING;
-
-    private static ModuleMain instance;
-    
+    private static final long SUPPORTED_ACTIONS = PlaybackState.ACTION_PLAY | PlaybackState.ACTION_PAUSE | PlaybackState.ACTION_PLAY_PAUSE | PlaybackState.ACTION_SKIP_TO_PREVIOUS | PlaybackState.ACTION_SKIP_TO_NEXT | PlaybackState.ACTION_STOP | PlaybackState.ACTION_SEEK_TO | PlaybackState.ACTION_SET_RATING;
+    private static final int DEBOUNCE_DELAY_MS = 100;
+    private static final int ALBUM_ART_SIZE = 160;
+    private static final long PLAYBACK_STATE_THROTTLE_MS = 1000;
     private Context appContext;
     private NotificationManager notificationManager;
     private MediaSessionManager mediaSessionManager;
+    private AudioManager audioManager;
     private Handler mainHandler;
-    private android.content.BroadcastReceiver mediaControlReceiver;
-    
     private MediaSession targetMediaSession;
     private MediaController mediaController;
     private MediaController.Callback mediaCallback;
     private MediaSession.Callback originalCallback;
-    
+    private String currentMediaId = "";
     private String currentTitle = "Netease Cloud Music";
     private String currentArtist = "";
     private Bitmap currentAlbumArt = null;
     private boolean isPlaying = false;
     private boolean isLiked = false;
-    private String lastTitle = "";
     private boolean isNotificationClosed = false;
-    
+    private String lastMediaId = "";
+    private String lastTitle = "";
+    private String lastArtist = "";
+    private boolean lastIsPlaying = false;
+    private boolean lastIsLiked = false;
+    private Runnable debounceRunnable;
+    private long lastLocalLikeUpdateTime = 0;  // 本地收藏状态更新时间
+    private static final long LOCAL_STATE_PRIORITY_MS = 2000;  // 本地状态优先时间窗口
+    private long lastPlaybackStateUpdateTime = 0;
+    private String currentAlbumArtKey = "";
+    private boolean hasPrivateAudioDevice = false;
+    private boolean audioDeviceCallbackRegistered = false;
+    private Set<Integer> currentPrivateDeviceIds = new HashSet<>();
     private Icon iconPrev = null;
     private Icon iconPlay = null;
     private Icon iconPause = null;
@@ -86,506 +89,416 @@ public class ModuleMain implements IXposedHookLoadPackage {
     private Icon iconLikeBorder = null;
     private Icon iconClose = null;
     private boolean iconsInitialized = false;
+    private PendingIntent cachedPrevPI = null;
+    private PendingIntent cachedPlayPausePI = null;
+    private PendingIntent cachedNextPI = null;
+    private PendingIntent cachedLikePI = null;
+    private PendingIntent cachedClosePI = null;
+    private boolean pendingIntentsInitialized = false;
+    private android.content.BroadcastReceiver mediaControlReceiver;
+
+    private static final int NOTIFICATION_UPDATE_DEBOUNCE_MS = 400;
 
     @Override
-    public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
-        if (!TARGET_PACKAGE.equals(lpparam.packageName)) {
-            return;
-        }
-        
-        instance = this;
-        Log.d(TAG, "模块已加载，开始Hook");
-
+    public void onPackageLoaded(XposedModuleInterface.PackageLoadedParam param) {
+        if (!TARGET_PACKAGE.equals(param.getPackageName())) return;
+        L.d(TAG, "Module loaded, starting hooks");
         try {
-            // Hook Application.attach
-            XposedHelpers.findAndHookMethod(Application.class, "attach", Context.class, new XC_MethodHook() {
-                @Override
-                protected void afterHookedMethod(MethodHookParam param) {
-                    appContext = (Context) param.args[0];
-                    Log.d(TAG, "Application.attach 被调用");
-                    initIcons();
-                    initNotificationSystem();
-                }
-            });
+            Method attachMethod = Application.class.getDeclaredMethod("attach", Context.class);
+            hook(attachMethod).intercept(new ApplicationAttachHooker());
+            Method onCreateMethod = Application.class.getDeclaredMethod("onCreate");
+            hook(onCreateMethod).intercept(new ApplicationOnCreateHooker());
+            hook(MediaSession.class.getDeclaredConstructor(Context.class, String.class)).intercept(new MediaSessionCtorHooker1());
+            hook(MediaSession.class.getDeclaredConstructor(Context.class, String.class, Bundle.class)).intercept(new MediaSessionCtorHooker2());
+            Method setCallbackMethod = MediaSession.class.getDeclaredMethod("setCallback", MediaSession.Callback.class, Handler.class);
+            hook(setCallbackMethod).intercept(new MediaSessionSetCallbackHooker());
+            Method setActiveMethod = MediaSession.class.getDeclaredMethod("setActive", boolean.class);
+            hook(setActiveMethod).intercept(new MediaSessionSetActiveHooker());
+            Method setMetadataMethod = MediaSession.class.getDeclaredMethod("setMetadata", MediaMetadata.class);
+            hook(setMetadataMethod).intercept(new MediaSessionSetMetadataHooker());
+            Method setPlaybackStateMethod = MediaSession.class.getDeclaredMethod("setPlaybackState", PlaybackState.class);
+            hook(setPlaybackStateMethod).intercept(new MediaSessionSetPlaybackStateHooker());
+        } catch (Exception e) { L.e(TAG, "Hook failed: " + e.getMessage()); }
+    }
 
-            // Hook Application.onCreate
-            XposedHelpers.findAndHookMethod(Application.class, "onCreate", new XC_MethodHook() {
-                @Override
-                protected void afterHookedMethod(MethodHookParam param) {
-                    startMediaSessionMonitor();
-                }
-            });
-
-            // Hook MediaSession 构造函数
-            XposedHelpers.findAndHookConstructor(MediaSession.class, Context.class, String.class, new XC_MethodHook() {
-                @Override
-                protected void afterHookedMethod(MethodHookParam param) {
-                    targetMediaSession = (MediaSession) param.thisObject;
-                }
-            });
-
-            XposedHelpers.findAndHookConstructor(MediaSession.class, Context.class, String.class, Bundle.class, new XC_MethodHook() {
-                @Override
-                protected void afterHookedMethod(MethodHookParam param) {
-                    targetMediaSession = (MediaSession) param.thisObject;
-                }
-            });
-
-            // Hook MediaSession.setCallback
-            XposedHelpers.findAndHookMethod(MediaSession.class, "setCallback", MediaSession.Callback.class, Handler.class, new XC_MethodHook() {
-                @Override
-                protected void beforeHookedMethod(MethodHookParam param) {
-                    MediaSession session = (MediaSession) param.thisObject;
-                    MediaSession.Callback callback = (MediaSession.Callback) param.args[0];
-                    Handler handler = (Handler) param.args[1];
-                    
-                    if (session == targetMediaSession && callback != null) {
-                        originalCallback = callback;
-                        param.args[0] = new LikeCallbackWrapper();
-                    }
-                }
-            });
-
-            // Hook MediaSession.setActive
-            XposedHelpers.findAndHookMethod(MediaSession.class, "setActive", boolean.class, new XC_MethodHook() {
-                @Override
-                protected void afterHookedMethod(MethodHookParam param) {
-                    boolean active = (boolean) param.args[0];
-                    MediaSession session = (MediaSession) param.thisObject;
-                    
-                    if (active && session == targetMediaSession) {
-                        isNotificationClosed = false;
-                        setupMediaController();
-                        injectInitialPlaybackState();
-                    } else if (!active) {
-                        isNotificationClosed = true;
-                        cancelNotification();
-                    }
-                }
-            });
-
-            // Hook MediaSession.setMetadata
-            XposedHelpers.findAndHookMethod(MediaSession.class, "setMetadata", MediaMetadata.class, new XC_MethodHook() {
-                @Override
-                protected void afterHookedMethod(MethodHookParam param) {
-                    MediaMetadata metadata = (MediaMetadata) param.args[0];
-                    MediaSession session = (MediaSession) param.thisObject;
-                    
-                    if (metadata != null && session == targetMediaSession) {
-                        updateMetadata(metadata);
-                        checkLikeStatusFromMetadata(metadata);
-                        updateNotification();
-                    }
-                }
-            });
-
-            // Hook MediaSession.setPlaybackState
-            XposedHelpers.findAndHookMethod(MediaSession.class, "setPlaybackState", PlaybackState.class, new XC_MethodHook() {
-                @Override
-                protected void beforeHookedMethod(MethodHookParam param) {
-                    MediaSession session = (MediaSession) param.thisObject;
-                    PlaybackState originalState = (PlaybackState) param.args[0];
-                    
-                    if (originalState != null && session == targetMediaSession) {
-                        checkLikeStatusFromPlaybackState(originalState);
-                        PlaybackState modifiedState = injectPlaybackActions(originalState);
-                        param.args[0] = modifiedState;
-                    }
-                }
-                
-                @Override
-                protected void afterHookedMethod(MethodHookParam param) {
-                    MediaSession session = (MediaSession) param.thisObject;
-                    PlaybackState state = (PlaybackState) param.args[0];
-                    
-                    if (state != null && session == targetMediaSession) {
-                        updatePlaybackState(state);
-                        updateNotification();
-                    }
-                }
-            });
-
-        } catch (Exception e) {
-            Log.e(TAG, "Hook失败: " + e.getMessage());
+    public class ApplicationAttachHooker implements XposedInterface.Hooker {
+        @Override
+        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+            appContext = (Context) chain.getArg(0);
+            Object result = chain.proceed();
+            initIcons();
+            initNotificationSystem();
+            initPendingIntents();
+            registerMediaControlReceiver();
+            return result;
         }
     }
 
-    private void initIcons() {
-        if (iconsInitialized) {
-            return;
-        }
-        
-        Log.d(TAG, "开始从 assets 加载图标");
-        
-        iconPrev = loadIconFromAssets("icons/ic_prev.png");
-        iconPlay = loadIconFromAssets("icons/ic_play.png");
-        iconPause = loadIconFromAssets("icons/ic_pause.png");
-        iconNext = loadIconFromAssets("icons/ic_next.png");
-        iconLikeFilled = loadIconFromAssets("icons/ic_like_filled.png");
-        iconLikeBorder = loadIconFromAssets("icons/ic_like_border.png");
-        iconClose = loadIconFromAssets("icons/ic_close.png");
-        
-        Log.d(TAG, "图标加载结果: prev=" + (iconPrev != null) + ", play=" + (iconPlay != null) + ", close=" + (iconClose != null));
-        
-        iconsInitialized = true;
+    public class ApplicationOnCreateHooker implements XposedInterface.Hooker {
+        @Override
+        public Object intercept(XposedInterface.Chain chain) throws Throwable { return chain.proceed(); }
     }
-    
-    private Icon loadIconFromAssets(String filename) {
-        if (appContext == null) return null;
-        try {
-            Context moduleContext = appContext.createPackageContext(
-                "io.github.lostmymind.ncm.car.notify", 
-                Context.CONTEXT_IGNORE_SECURITY
-            );
-            android.content.res.AssetManager assets = moduleContext.getAssets();
-            Bitmap bitmap = BitmapFactory.decodeStream(assets.open(filename));
-            if (bitmap != null) {
-                return Icon.createWithBitmap(bitmap);
+
+    public class MediaSessionCtorHooker1 implements XposedInterface.Hooker {
+        @Override
+        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+            chain.proceed();
+            targetMediaSession = (MediaSession) chain.getThisObject();
+            L.d(TAG, "MediaSession captured via constructor 1");
+            return null;
+        }
+    }
+
+    public class MediaSessionCtorHooker2 implements XposedInterface.Hooker {
+        @Override
+        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+            chain.proceed();
+            targetMediaSession = (MediaSession) chain.getThisObject();
+            L.d(TAG, "MediaSession captured via constructor 2");
+            return null;
+        }
+    }
+
+    public class MediaSessionSetCallbackHooker implements XposedInterface.Hooker {
+        @Override
+        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+            MediaSession session = (MediaSession) chain.getThisObject();
+            MediaSession.Callback callback = (MediaSession.Callback) chain.getArg(0);
+            Handler handler = (Handler) chain.getArg(1);
+            if (session == targetMediaSession && callback != null) {
+                originalCallback = callback;
+                return chain.proceed(new Object[]{new LikeCallbackWrapper(), handler});
             }
-        } catch (Exception e) {
-            Log.e(TAG, "loadIconFromAssets error: " + e.getMessage());
+            return chain.proceed();
         }
-        return null;
     }
 
     public class LikeCallbackWrapper extends MediaSession.Callback {
         @Override
         public void onCustomAction(String action, Bundle extras) {
-            if (CUSTOM_ACTION_CLOSE.equals(action)) {
-                handleCloseAction();
-            } else if (CUSTOM_ACTION_LIKE.equals(action)) {
-                handleLikeAction();
-            } else if (originalCallback != null) {
-                originalCallback.onCustomAction(action, extras);
-            }
+            if (CUSTOM_ACTION_CLOSE.equals(action)) handleCloseAction();
+            else if (CUSTOM_ACTION_LIKE.equals(action)) handleLikeAction();
+            else if (originalCallback != null) originalCallback.onCustomAction(action, extras);
         }
-
         @Override
-        public void onPlay() {
-            if (originalCallback != null) originalCallback.onPlay();
-        }
-
+        public void onPlay() { if (originalCallback != null) originalCallback.onPlay(); }
         @Override
-        public void onPause() {
-            if (originalCallback != null) originalCallback.onPause();
-        }
-
+        public void onPause() { if (originalCallback != null) originalCallback.onPause(); }
         @Override
-        public void onSkipToNext() {
-            if (originalCallback != null) originalCallback.onSkipToNext();
-        }
-
+        public void onSkipToNext() { if (originalCallback != null) originalCallback.onSkipToNext(); }
         @Override
-        public void onSkipToPrevious() {
-            if (originalCallback != null) originalCallback.onSkipToPrevious();
-        }
-
+        public void onSkipToPrevious() { if (originalCallback != null) originalCallback.onSkipToPrevious(); }
         @Override
-        public void onSeekTo(long pos) {
-            if (originalCallback != null) originalCallback.onSeekTo(pos);
-        }
-
+        public void onSeekTo(long pos) { if (originalCallback != null) originalCallback.onSeekTo(pos); }
         @Override
-        public void onStop() {
-            if (originalCallback != null) originalCallback.onStop();
-        }
-
+        public void onStop() { if (originalCallback != null) originalCallback.onStop(); }
         @Override
         public void onSetRating(Rating rating) {
             if (rating != null && rating.getRatingStyle() == Rating.RATING_HEART) {
-                isLiked = rating.hasHeart();
-                updatePlaybackStateAndNotification();
+                long now = System.currentTimeMillis();
+                // 本地状态优先：在本地刚修改收藏状态后，忽略系统回写
+                if (now - lastLocalLikeUpdateTime < LOCAL_STATE_PRIORITY_MS) {
+                    L.d(TAG, "Local like state priority in callback, skip system update");
+                } else {
+                    isLiked = rating.hasHeart();
+                    updateLikePendingIntent();
+                    scheduleDebouncedUpdate();
+                }
             }
             if (originalCallback != null) originalCallback.onSetRating(rating);
         }
     }
 
-    private void handleCloseAction() {
-        try {
-            isNotificationClosed = true;
-            cancelNotification();
-            if (originalCallback != null) {
-                originalCallback.onPause();
+    public class MediaSessionSetActiveHooker implements XposedInterface.Hooker {
+        @Override
+        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+            boolean active = (boolean) chain.getArg(0);
+            MediaSession session = (MediaSession) chain.getThisObject();
+            chain.proceed();
+            if (active && session == targetMediaSession) {
+                isNotificationClosed = false;
+                setupMediaController();
+                injectInitialPlaybackState();
+            } else if (!active) {
+                isNotificationClosed = true;
+                cancelNotification();
             }
-        } catch (Exception e) {
-            Log.e(TAG, "handleCloseAction error: " + e.getMessage());
+            return null;
         }
     }
 
-    private void handleLikeAction() {
-        try {
-            if (originalCallback != null) {
-                Rating rating = Rating.newHeartRating(!isLiked);
-                originalCallback.onSetRating(rating);
+    public class MediaSessionSetMetadataHooker implements XposedInterface.Hooker {
+        @Override
+        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+            MediaMetadata metadata = (MediaMetadata) chain.getArg(0);
+            MediaSession session = (MediaSession) chain.getThisObject();
+            chain.proceed();
+            if (metadata != null && session == targetMediaSession) {
+                isNotificationClosed = false;
+                updateMetadataInternal(metadata);
             }
-            isLiked = !isLiked;
-            updatePlaybackStateAndNotification();
-        } catch (Exception ignored) {
+            return null;
         }
     }
 
-    private void checkLikeStatusFromMetadata(MediaMetadata metadata) {
-        try {
-            Rating userRating = metadata.getRating(MediaMetadata.METADATA_KEY_USER_RATING);
-            if (userRating != null && userRating.getRatingStyle() == Rating.RATING_HEART) {
-                isLiked = userRating.hasHeart();
-                return;
-            }
-            
-            Rating rating = metadata.getRating(MediaMetadata.METADATA_KEY_RATING);
-            if (rating != null && rating.getRatingStyle() == Rating.RATING_HEART) {
-                isLiked = rating.hasHeart();
-            }
-        } catch (Exception ignored) {
-        }
-    }
-
-    private void checkLikeStatusFromPlaybackState(PlaybackState state) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            try {
-                Bundle extras = state.getExtras();
-                if (extras != null) {
-                    String[] likeKeys = {"liked", "is_liked", "favorite", "is_favorite", "like", "love"};
-                    for (String key : likeKeys) {
-                        if (extras.containsKey(key)) {
-                            Object val = extras.get(key);
-                            if (val instanceof Boolean) {
-                                isLiked = (Boolean) val;
-                                break;
-                            }
-                        }
+    public class MediaSessionSetPlaybackStateHooker implements XposedInterface.Hooker {
+        @Override
+        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+            MediaSession session = (MediaSession) chain.getThisObject();
+            PlaybackState originalState = (PlaybackState) chain.getArg(0);
+            if (originalState != null && session == targetMediaSession) {
+                long now = System.currentTimeMillis();
+                if (now - lastPlaybackStateUpdateTime < PLAYBACK_STATE_THROTTLE_MS) {
+                    if (isOnlyPositionChanged(originalState)) {
+                        chain.proceed();
+                        return null;
                     }
                 }
-            } catch (Exception ignored) {
+                lastPlaybackStateUpdateTime = now;
+                PlaybackState modifiedState = injectPlaybackActionsIfNeeded(originalState);
+                chain.proceed(new Object[]{modifiedState});
+            } else {
+                chain.proceed();
             }
+            return null;
+        }
+        private boolean isOnlyPositionChanged(PlaybackState newState) {
+            return newState.getState() == (isPlaying ? PlaybackState.STATE_PLAYING : PlaybackState.STATE_PAUSED);
         }
     }
 
-    private void injectInitialPlaybackState() {
+    private void initIcons() {
+        if (iconsInitialized) return;
+        L.d(TAG, "Loading icons from drawable resources");
         try {
-            if (targetMediaSession == null) return;
-            
-            PlaybackState initialState = buildPlaybackState(PlaybackState.STATE_PAUSED, 0, 1.0f);
-            targetMediaSession.setPlaybackState(initialState);
-        } catch (Exception ignored) {
-        }
+            Context moduleContext = appContext.createPackageContext("io.github.lostmymind.ncm.car.notify", Context.CONTEXT_IGNORE_SECURITY);
+            int prevId = moduleContext.getResources().getIdentifier("ic_skip_previous", "drawable", "io.github.lostmymind.ncm.car.notify");
+            int playId = moduleContext.getResources().getIdentifier("ic_play", "drawable", "io.github.lostmymind.ncm.car.notify");
+            int pauseId = moduleContext.getResources().getIdentifier("ic_pause", "drawable", "io.github.lostmymind.ncm.car.notify");
+            int nextId = moduleContext.getResources().getIdentifier("ic_skip_next", "drawable", "io.github.lostmymind.ncm.car.notify");
+            int likeFilledId = moduleContext.getResources().getIdentifier("ic_favorite", "drawable", "io.github.lostmymind.ncm.car.notify");
+            int likeBorderId = moduleContext.getResources().getIdentifier("ic_favorite_border", "drawable", "io.github.lostmymind.ncm.car.notify");
+            int closeId = moduleContext.getResources().getIdentifier("ic_close", "drawable", "io.github.lostmymind.ncm.car.notify");
+            if (prevId != 0) iconPrev = loadBitmapIcon(moduleContext, prevId);
+            if (playId != 0) iconPlay = loadBitmapIcon(moduleContext, playId);
+            if (pauseId != 0) iconPause = loadBitmapIcon(moduleContext, pauseId);
+            if (nextId != 0) iconNext = loadBitmapIcon(moduleContext, nextId);
+            if (likeFilledId != 0) iconLikeFilled = loadBitmapIcon(moduleContext, likeFilledId);
+            if (likeBorderId != 0) iconLikeBorder = loadBitmapIcon(moduleContext, likeBorderId);
+            if (closeId != 0) iconClose = loadBitmapIcon(moduleContext, closeId);
+        } catch (Exception e) { L.e(TAG, "initIcons error: " + e.getMessage()); }
+        iconsInitialized = true;
     }
 
-    private void updatePlaybackStateAndNotification() {
+    private Icon loadBitmapIcon(Context moduleContext, int resId) {
         try {
-            if (targetMediaSession == null || mediaController == null) return;
-            
-            PlaybackState currentState = mediaController.getPlaybackState();
-            if (currentState != null) {
-                PlaybackState newState = buildPlaybackState(
-                    currentState.getState(),
-                    currentState.getPosition(),
-                    currentState.getPlaybackSpeed()
-                );
-                targetMediaSession.setPlaybackState(newState);
-            }
-            updateNotification();
-        } catch (Exception ignored) {
-        }
-    }
-
-    private PlaybackState buildPlaybackState(int state, long position, float speed) {
-        PlaybackState.Builder builder = new PlaybackState.Builder();
-        builder.setState(state, position, speed);
-        builder.setActions(SUPPORTED_ACTIONS);
-        
-        int likeIconRes = isLiked ? android.R.drawable.star_on : android.R.drawable.star_off;
-        String likeLabel = isLiked ? "Unlike" : "Like";
-        PlaybackState.CustomAction likeAction = new PlaybackState.CustomAction.Builder(
-            CUSTOM_ACTION_LIKE, likeLabel, likeIconRes
-        ).build();
-        builder.addCustomAction(likeAction);
-        
-        PlaybackState.CustomAction closeAction = new PlaybackState.CustomAction.Builder(
-            CUSTOM_ACTION_CLOSE, "Close", android.R.drawable.ic_menu_close_clear_cancel
-        ).build();
-        builder.addCustomAction(closeAction);
-        
-        return builder.build();
-    }
-
-    private PlaybackState injectPlaybackActions(PlaybackState original) {
-        try {
-            PlaybackState.Builder builder = new PlaybackState.Builder();
-            
-            long position = original.getPosition();
-            if (position < 0) position = 0;
-            
-            builder.setState(original.getState(), position, original.getPlaybackSpeed());
-            builder.setBufferedPosition(original.getBufferedPosition());
-            builder.setActions(original.getActions() | SUPPORTED_ACTIONS);
-            
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                builder.setExtras(original.getExtras());
-            }
-            
-            int likeIconRes = isLiked ? android.R.drawable.star_on : android.R.drawable.star_off;
-            String likeLabel = isLiked ? "Unlike" : "Like";
-            PlaybackState.CustomAction likeAction = new PlaybackState.CustomAction.Builder(
-                CUSTOM_ACTION_LIKE, likeLabel, likeIconRes
-            ).build();
-            builder.addCustomAction(likeAction);
-            
-            PlaybackState.CustomAction closeAction = new PlaybackState.CustomAction.Builder(
-                CUSTOM_ACTION_CLOSE, "Close", android.R.drawable.ic_menu_close_clear_cancel
-            ).build();
-            builder.addCustomAction(closeAction);
-            
-            return builder.build();
+            Bitmap bitmap = BitmapFactory.decodeResource(moduleContext.getResources(), resId);
+            if (bitmap != null) return Icon.createWithBitmap(bitmap);
         } catch (Exception e) {
-            return original;
+            L.e(TAG, "loadBitmapIcon error: " + e.getMessage());
         }
+        return null;
+    }
+
+
+
+    private void initPendingIntents() {
+        if (pendingIntentsInitialized || appContext == null) return;
+        int flags = PendingIntent.FLAG_UPDATE_CURRENT;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) flags |= PendingIntent.FLAG_IMMUTABLE;
+        Intent prevIntent = new Intent(ACTION_MEDIA_CONTROL).putExtra(EXTRA_CONTROL_ACTION, "prev");
+        cachedPrevPI = PendingIntent.getBroadcast(appContext, REQUEST_PREV, prevIntent, flags);
+        Intent playPauseIntent = new Intent(ACTION_MEDIA_CONTROL).putExtra(EXTRA_CONTROL_ACTION, "playPause");
+        cachedPlayPausePI = PendingIntent.getBroadcast(appContext, REQUEST_PLAY_PAUSE, playPauseIntent, flags);
+        Intent nextIntent = new Intent(ACTION_MEDIA_CONTROL).putExtra(EXTRA_CONTROL_ACTION, "next");
+        cachedNextPI = PendingIntent.getBroadcast(appContext, REQUEST_NEXT, nextIntent, flags);
+        updateLikePendingIntent();
+        Intent closeIntent = new Intent(ACTION_MEDIA_CONTROL).putExtra(EXTRA_CONTROL_ACTION, "close");
+        cachedClosePI = PendingIntent.getBroadcast(appContext, REQUEST_CLOSE, closeIntent, flags);
+        pendingIntentsInitialized = true;
+    }
+
+    private void updateLikePendingIntent() {
+        if (appContext == null) return;
+        int flags = PendingIntent.FLAG_UPDATE_CURRENT;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) flags |= PendingIntent.FLAG_IMMUTABLE;
+        int requestCode = REQUEST_LIKE + (isLiked ? 1000 : 0);
+        Intent likeIntent = new Intent(ACTION_MEDIA_CONTROL).putExtra(EXTRA_CONTROL_ACTION, "toggleLike");
+        cachedLikePI = PendingIntent.getBroadcast(appContext, requestCode, likeIntent, flags);
     }
 
     private void initNotificationSystem() {
         try {
             notificationManager = (NotificationManager) appContext.getSystemService(Context.NOTIFICATION_SERVICE);
             mediaSessionManager = (MediaSessionManager) appContext.getSystemService(Context.MEDIA_SESSION_SERVICE);
+            audioManager = (AudioManager) appContext.getSystemService(Context.AUDIO_SERVICE);
             mainHandler = new Handler(Looper.getMainLooper());
-
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                NotificationChannel channel = new NotificationChannel(
-                    CHANNEL_ID, "Media Playback", NotificationManager.IMPORTANCE_LOW
-                );
+                NotificationChannel channel = new NotificationChannel(CHANNEL_ID, "Media Playback", NotificationManager.IMPORTANCE_LOW);
                 channel.setDescription("Music playback control");
                 channel.setShowBadge(false);
                 channel.setLockscreenVisibility(Notification.VISIBILITY_PUBLIC);
                 notificationManager.createNotificationChannel(channel);
             }
-        } catch (Exception ignored) {
-        }
-    }
-
-    private void startMediaSessionMonitor() {
-        mainHandler.postDelayed(new Runnable() {
-            @Override
-            public void run() {
-                findActiveMediaSession();
-                mainHandler.postDelayed(this, 5000);
-            }
-        }, 1000);
-    }
-
-    private void findActiveMediaSession() {
-        try {
-            if (mediaSessionManager == null) return;
-            
-            for (MediaController controller : mediaSessionManager.getActiveSessions(null)) {
-                if (TARGET_PACKAGE.equals(controller.getPackageName())) {
-                    if (mediaController == null || mediaController != controller) {
-                        mediaController = controller;
-                        setupMediaControllerCallback();
-                    }
-                    return;
-                }
-            }
-        } catch (Exception ignored) {
-        }
+            registerAudioDeviceCallback();
+        } catch (Exception e) { L.e(TAG, "initNotificationSystem error: " + e.getMessage()); }
     }
 
     private void setupMediaController() {
         try {
             if (targetMediaSession == null) return;
-            
             mediaController = targetMediaSession.getController();
             if (mediaController != null) {
                 setupMediaControllerCallback();
-                
                 MediaMetadata metadata = mediaController.getMetadata();
                 PlaybackState state = mediaController.getPlaybackState();
-                
-                if (metadata != null) {
-                    updateMetadata(metadata);
-                    checkLikeStatusFromMetadata(metadata);
-                }
-                if (state != null) {
-                    updatePlaybackState(state);
-                    checkLikeStatusFromPlaybackState(state);
-                }
-                
-                updateNotification();
+                if (metadata != null) updateMetadataInternal(metadata);
+                if (state != null) isPlaying = state.getState() == PlaybackState.STATE_PLAYING;
+                resetLastState();
+                scheduleDebouncedUpdate();
             }
-        } catch (Exception ignored) {
-        }
+        } catch (Exception e) { L.e(TAG, "setupMediaController error: " + e.getMessage()); }
     }
 
     private void setupMediaControllerCallback() {
         if (mediaController == null) return;
-        
-        if (mediaCallback != null) {
-            mediaController.unregisterCallback(mediaCallback);
-        }
-        
+        if (mediaCallback != null) mediaController.unregisterCallback(mediaCallback);
         mediaCallback = new MediaController.Callback() {
             @Override
             public void onMetadataChanged(MediaMetadata metadata) {
                 if (metadata != null) {
                     isNotificationClosed = false;
-                    updateMetadata(metadata);
-                    checkLikeStatusFromMetadata(metadata);
-                    updateNotification();
+                    updateMetadataInternal(metadata);
+                    scheduleDebouncedUpdate();
                 }
             }
-
             @Override
             public void onPlaybackStateChanged(PlaybackState state) {
                 if (state != null) {
-                    updatePlaybackState(state);
-                    checkLikeStatusFromPlaybackState(state);
-                    updateNotification();
+                    boolean newIsPlaying = (state.getState() == PlaybackState.STATE_PLAYING);
+                    if (newIsPlaying != isPlaying) {
+                        isPlaying = newIsPlaying;
+                        scheduleDebouncedUpdate();
+                    }
                 }
             }
-
             @Override
-            public void onSessionDestroyed() {
-                cancelNotification();
-            }
+            public void onSessionDestroyed() { cancelNotification(); }
         };
-        
         mediaController.registerCallback(mediaCallback, mainHandler);
     }
 
-    private void updateMetadata(MediaMetadata metadata) {
+    private void updateMetadataInternal(MediaMetadata metadata) {
         try {
-            String title = metadata.getString(MediaMetadata.METADATA_KEY_TITLE);
-            
-            if (title != null && !title.equals(lastTitle)) {
-                lastTitle = title;
-                isLiked = false;
+            String newMediaId = extractMediaId(metadata);
+            String newTitle = metadata.getString(MediaMetadata.METADATA_KEY_TITLE);
+            String newArtist = metadata.getString(MediaMetadata.METADATA_KEY_ARTIST);
+            Bitmap newAlbumArt = metadata.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART);
+            boolean songChanged = false;
+            if (newMediaId != null && !newMediaId.isEmpty()) {
+                if (!newMediaId.equals(currentMediaId)) {
+                    songChanged = true;
+                    currentMediaId = newMediaId;
+                }
+            } else if (newTitle != null && !newTitle.equals(currentTitle)) {
+                songChanged = true;
             }
-            
-            String artist = metadata.getString(MediaMetadata.METADATA_KEY_ARTIST);
-            Bitmap art = metadata.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART);
-            
-            if (title != null) currentTitle = title;
-            if (artist != null) currentArtist = artist;
-            if (art != null) currentAlbumArt = art;
-        } catch (Exception ignored) {
-        }
+            if (songChanged) {
+                isLiked = false;
+                updateLikePendingIntent();
+                currentAlbumArtKey = "";
+                L.d(TAG, "Song changed, reset like status");
+            }
+            // 从 metadata 检测收藏状态
+            checkLikeStatusFromMetadata(metadata);
+            if (newTitle != null) currentTitle = newTitle;
+            currentArtist = newArtist;
+            updateAlbumArtIfNeeded(newAlbumArt, songChanged);
+        } catch (Exception e) { L.e(TAG, "updateMetadataInternal error: " + e.getMessage()); }
     }
 
-    private void updatePlaybackState(PlaybackState state) {
-        isPlaying = state.getState() == PlaybackState.STATE_PLAYING;
-    }
-
-    private void updateNotification() {
-        if (isNotificationClosed) {
+    private void updateAlbumArtIfNeeded(Bitmap newAlbumArt, boolean songChanged) {
+        String desiredKey = currentMediaId != null && !currentMediaId.isEmpty() ? currentMediaId : currentTitle + "|" + currentArtist;
+        if (newAlbumArt == null) {
+            currentAlbumArt = null;
+            currentAlbumArtKey = "";
             return;
         }
-        
+        if (!songChanged && desiredKey.equals(currentAlbumArtKey) && currentAlbumArt != null) return;
+        currentAlbumArt = scaleBitmap(newAlbumArt, ALBUM_ART_SIZE);
+        currentAlbumArtKey = desiredKey;
+    }
+
+    private void checkLikeStatusFromMetadata(MediaMetadata metadata) {
         try {
-            if (appContext == null || notificationManager == null) return;
-            
-            MediaSession.Token token = null;
-            if (targetMediaSession != null) {
-                token = targetMediaSession.getSessionToken();
+            // 本地状态优先：在本地刚修改收藏状态后的一段时间内，忽略系统回写
+            long now = System.currentTimeMillis();
+            if (now - lastLocalLikeUpdateTime < LOCAL_STATE_PRIORITY_MS) {
+                L.d(TAG, "Local like state priority, skip system callback");
+                return;
             }
 
+            // 优先检查 USER_RATING
+            Rating userRating = metadata.getRating(MediaMetadata.METADATA_KEY_USER_RATING);
+            if (userRating != null && userRating.getRatingStyle() == Rating.RATING_HEART) {
+                isLiked = userRating.hasHeart();
+                updateLikePendingIntent();
+                L.d(TAG, "Like status from USER_RATING: " + isLiked);
+                return;
+            }
+            // 回退检查 RATING
+            Rating rating = metadata.getRating(MediaMetadata.METADATA_KEY_RATING);
+            if (rating != null && rating.getRatingStyle() == Rating.RATING_HEART) {
+                isLiked = rating.hasHeart();
+                updateLikePendingIntent();
+                L.d(TAG, "Like status from RATING: " + isLiked);
+            }
+        } catch (Exception e) { L.e(TAG, "checkLikeStatusFromMetadata error: " + e.getMessage()); }
+    }
+
+    private String extractMediaId(MediaMetadata metadata) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            String mediaId = metadata.getString(MediaMetadata.METADATA_KEY_MEDIA_ID);
+            if (mediaId != null && !mediaId.isEmpty()) return mediaId;
+        }
+        String title = metadata.getString(MediaMetadata.METADATA_KEY_TITLE);
+        String artist = metadata.getString(MediaMetadata.METADATA_KEY_ARTIST);
+        return (title != null ? title : "") + "|" + (artist != null ? artist : "");
+    }
+
+    private Bitmap scaleBitmap(Bitmap source, int maxSize) {
+        if (source == null) return null;
+        int width = source.getWidth();
+        int height = source.getHeight();
+        if (width <= maxSize && height <= maxSize) return source;
+        float scale = Math.min((float) maxSize / width, (float) maxSize / height);
+        try { return Bitmap.createScaledBitmap(source, Math.round(width * scale), Math.round(height * scale), true); }
+        catch (Exception e) { return source; }
+    }
+
+    private void resetLastState() { lastMediaId = ""; lastTitle = ""; lastArtist = ""; lastIsPlaying = false; lastIsLiked = false; }
+    private boolean hasStateChanged() { return !currentMediaId.equals(lastMediaId) || !currentTitle.equals(lastTitle) || !currentArtist.equals(lastArtist) || isPlaying != lastIsPlaying || isLiked != lastIsLiked; }
+    private void updateLastState() { lastMediaId = currentMediaId; lastTitle = currentTitle; lastArtist = currentArtist; lastIsPlaying = isPlaying; lastIsLiked = isLiked; }
+
+    private void scheduleDebouncedUpdate() {
+        if (mainHandler == null) return;
+        if (debounceRunnable != null) mainHandler.removeCallbacks(debounceRunnable);
+        debounceRunnable = new Runnable() {
+            @Override
+            public void run() {
+                if (!hasStateChanged()) { L.d(TAG, "State unchanged, skip notification update"); return; }
+                updateLastState();
+                updateNotificationInternal();
+            }
+        };
+        mainHandler.postDelayed(debounceRunnable, NOTIFICATION_UPDATE_DEBOUNCE_MS);
+    }
+
+    private void updateNotificationInternal() {
+        if (isNotificationClosed) return;
+        try {
+            if (appContext == null || notificationManager == null) return;
+            MediaSession.Token token = targetMediaSession != null ? targetMediaSession.getSessionToken() : null;
             Notification.Builder builder = new Notification.Builder(appContext, CHANNEL_ID)
                 .setSmallIcon(android.R.drawable.ic_media_play)
                 .setContentTitle(currentTitle)
@@ -594,144 +507,61 @@ public class ModuleMain implements IXposedHookLoadPackage {
                 .setShowWhen(false)
                 .setVisibility(Notification.VISIBILITY_PUBLIC)
                 .setPriority(Notification.PRIORITY_LOW);
-
             Notification.MediaStyle mediaStyle = new Notification.MediaStyle();
-            if (token != null) {
-                mediaStyle.setMediaSession(token);
-            }
+            if (token != null) mediaStyle.setMediaSession(token);
             mediaStyle.setShowActionsInCompactView(0, 1, 2);
             builder.setStyle(mediaStyle);
-
             addMediaActions(builder);
-
-            if (currentAlbumArt != null) {
-                builder.setLargeIcon(currentAlbumArt);
-            }
-
+            if (currentAlbumArt != null) builder.setLargeIcon(currentAlbumArt);
             if (mediaController != null) {
                 try {
                     String packageName = mediaController.getPackageName();
                     Intent launchIntent = appContext.getPackageManager().getLaunchIntentForPackage(packageName);
                     if (launchIntent != null) {
                         int flags = PendingIntent.FLAG_UPDATE_CURRENT;
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                            flags |= PendingIntent.FLAG_IMMUTABLE;
-                        }
-                        PendingIntent contentIntent = PendingIntent.getActivity(
-                            appContext, 0, launchIntent, flags
-                        );
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) flags |= PendingIntent.FLAG_IMMUTABLE;
+                        PendingIntent contentIntent = PendingIntent.getActivity(appContext, 0, launchIntent, flags);
                         builder.setContentIntent(contentIntent);
                     }
-                } catch (Exception ignored) {
-                }
+                } catch (Exception ignored) {}
             }
-
             notificationManager.notify(NOTIFICATION_ID, builder.build());
-
-        } catch (Exception e) {
-            Log.e(TAG, "updateNotification error: " + e.getMessage());
-        }
+        } catch (Exception e) { L.e(TAG, "updateNotificationInternal error: " + e.getMessage()); }
     }
 
-    @android.annotation.SuppressLint("UnspecifiedRegisterReceiverFlag")
+    @SuppressLint("UnspecifiedRegisterReceiverFlag")
     private void addMediaActions(Notification.Builder builder) {
-        try {
-            registerMediaControlReceiver();
-            
-            // Previous
-            PendingIntent prevPI = createControlPendingIntent("prev", REQUEST_PREV);
-            if (iconPrev != null) {
-                builder.addAction(new Notification.Action.Builder(iconPrev, "Previous", prevPI).build());
-            } else {
-                builder.addAction(android.R.drawable.ic_media_previous, "Previous", prevPI);
-            }
-            
-            // Play/Pause
-            PendingIntent playPausePI = createControlPendingIntent("playPause", REQUEST_PLAY_PAUSE);
-            Icon playPauseIcon = isPlaying ? iconPause : iconPlay;
-            if (playPauseIcon != null) {
-                builder.addAction(new Notification.Action.Builder(playPauseIcon, isPlaying ? "Pause" : "Play", playPausePI).build());
-            } else {
-                int res = isPlaying ? android.R.drawable.ic_media_pause : android.R.drawable.ic_media_play;
-                builder.addAction(res, isPlaying ? "Pause" : "Play", playPausePI);
-            }
-            
-            // Next
-            PendingIntent nextPI = createControlPendingIntent("next", REQUEST_NEXT);
-            if (iconNext != null) {
-                builder.addAction(new Notification.Action.Builder(iconNext, "Next", nextPI).build());
-            } else {
-                builder.addAction(android.R.drawable.ic_media_next, "Next", nextPI);
-            }
-            
-            // Like
-            int likeRequestCode = REQUEST_LIKE + (isLiked ? 1000 : 0);
-            PendingIntent likePI = createControlPendingIntent("toggleLike", likeRequestCode);
-            Icon likeIcon = isLiked ? iconLikeFilled : iconLikeBorder;
-            if (likeIcon != null) {
-                builder.addAction(new Notification.Action.Builder(likeIcon, isLiked ? "Unlike" : "Like", likePI).build());
-            } else {
-                int res = isLiked ? android.R.drawable.star_on : android.R.drawable.star_off;
-                builder.addAction(res, isLiked ? "Unlike" : "Like", likePI);
-            }
-            
-            // Close
-            PendingIntent closePI = createControlPendingIntent("close", REQUEST_CLOSE);
-            if (iconClose != null) {
-                builder.addAction(new Notification.Action.Builder(iconClose, "Close", closePI).build());
-            } else {
-                builder.addAction(android.R.drawable.ic_menu_close_clear_cancel, "Close", closePI);
-            }
-        } catch (Exception e) {
-            Log.e(TAG, "addMediaActions error: " + e.getMessage());
-        }
+        if (iconPrev != null) builder.addAction(new Notification.Action.Builder(iconPrev, "Previous", cachedPrevPI).build());
+        else builder.addAction(android.R.drawable.ic_media_previous, "Previous", cachedPrevPI);
+        Icon playPauseIcon = isPlaying ? iconPause : iconPlay;
+        if (playPauseIcon != null) builder.addAction(new Notification.Action.Builder(playPauseIcon, isPlaying ? "Pause" : "Play", cachedPlayPausePI).build());
+        else builder.addAction(isPlaying ? android.R.drawable.ic_media_pause : android.R.drawable.ic_media_play, isPlaying ? "Pause" : "Play", cachedPlayPausePI);
+        if (iconNext != null) builder.addAction(new Notification.Action.Builder(iconNext, "Next", cachedNextPI).build());
+        else builder.addAction(android.R.drawable.ic_media_next, "Next", cachedNextPI);
+        Icon likeIcon = isLiked ? iconLikeFilled : iconLikeBorder;
+        if (likeIcon != null) builder.addAction(new Notification.Action.Builder(likeIcon, isLiked ? "Unlike" : "Like", cachedLikePI).build());
+        else builder.addAction(isLiked ? android.R.drawable.star_on : android.R.drawable.star_off, isLiked ? "Unlike" : "Like", cachedLikePI);
+        if (iconClose != null) builder.addAction(new Notification.Action.Builder(iconClose, "Close", cachedClosePI).build());
+        else builder.addAction(android.R.drawable.ic_menu_close_clear_cancel, "Close", cachedClosePI);
     }
 
-    private PendingIntent createControlPendingIntent(String action, int requestCode) {
-        Intent intent = new Intent(ACTION_MEDIA_CONTROL);
-        intent.putExtra(EXTRA_CONTROL_ACTION, action);
-        int flags = PendingIntent.FLAG_UPDATE_CURRENT;
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            flags |= PendingIntent.FLAG_IMMUTABLE;
-        }
-        return PendingIntent.getBroadcast(appContext, requestCode, intent, flags);
-    }
-    
+    @SuppressLint("UnspecifiedRegisterReceiverFlag")
     private void registerMediaControlReceiver() {
         if (mediaControlReceiver != null || appContext == null) return;
-        
         mediaControlReceiver = new android.content.BroadcastReceiver() {
             @Override
             public void onReceive(android.content.Context context, android.content.Intent intent) {
                 String action = intent.getStringExtra(EXTRA_CONTROL_ACTION);
                 if (action == null) return;
-                
                 switch (action) {
-                    case "prev":
-                        if (originalCallback != null) originalCallback.onSkipToPrevious();
-                        break;
-                    case "playPause":
-                        if (originalCallback != null) {
-                            if (isPlaying) {
-                                originalCallback.onPause();
-                            } else {
-                                originalCallback.onPlay();
-                            }
-                        }
-                        break;
-                    case "next":
-                        if (originalCallback != null) originalCallback.onSkipToNext();
-                        break;
-                    case "toggleLike":
-                        handleLikeAction();
-                        break;
-                    case "close":
-                        handleCloseAction();
-                        break;
+                    case "prev": if (originalCallback != null) originalCallback.onSkipToPrevious(); break;
+                    case "playPause": if (originalCallback != null) { if (isPlaying) originalCallback.onPause(); else originalCallback.onPlay(); } break;
+                    case "next": if (originalCallback != null) originalCallback.onSkipToNext(); break;
+                    case "toggleLike": handleLikeAction(); break;
+                    case "close": handleCloseAction(); break;
                 }
             }
         };
-        
         android.content.IntentFilter filter = new android.content.IntentFilter(ACTION_MEDIA_CONTROL);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             appContext.registerReceiver(mediaControlReceiver, filter, android.content.Context.RECEIVER_NOT_EXPORTED);
@@ -740,9 +570,140 @@ public class ModuleMain implements IXposedHookLoadPackage {
         }
     }
 
-    private void cancelNotification() {
-        if (notificationManager != null) {
-            notificationManager.cancel(NOTIFICATION_ID);
+    private void handleLikeAction() {
+        try {
+            // 先通知网易云
+            if (originalCallback != null) {
+                Rating rating = Rating.newHeartRating(!isLiked);
+                originalCallback.onSetRating(rating);
+            }
+            // 更新本地状态
+            isLiked = !isLiked;
+            lastLocalLikeUpdateTime = System.currentTimeMillis();
+            updateLikePendingIntent();
+            updatePlaybackStateAndNotification();
+        } catch (Exception e) { L.e(TAG, "handleLikeAction error: " + e.getMessage()); }
+    }
+
+    private void updatePlaybackStateAndNotification() {
+        try {
+            if (targetMediaSession == null || mediaController == null) {
+                updateNotificationInternal();
+                return;
+            }
+            PlaybackState currentState = mediaController.getPlaybackState();
+            if (currentState != null) {
+                PlaybackState newState = buildPlaybackState(
+                    currentState.getState(),
+                    Math.max(0, currentState.getPosition()),
+                    currentState.getPlaybackSpeed()
+                );
+                targetMediaSession.setPlaybackState(newState);
+            }
+            updateLastState();
+            updateNotificationInternal();
+        } catch (Exception e) { L.e(TAG, "updatePlaybackStateAndNotification error: " + e.getMessage()); }
+    }
+
+    private void handleCloseAction() {
+        try {
+            isNotificationClosed = true;
+            cancelNotification();
+            if (originalCallback != null) originalCallback.onPause();
+        } catch (Exception e) { L.e(TAG, "handleCloseAction error: " + e.getMessage()); }
+    }
+
+    private void injectInitialPlaybackState() {
+        try { if (targetMediaSession == null) return; targetMediaSession.setPlaybackState(buildPlaybackState(PlaybackState.STATE_PAUSED, 0, 1.0f)); } catch (Exception ignored) {}
+    }
+
+    private PlaybackState injectPlaybackActionsIfNeeded(PlaybackState original) {
+        if (hasRequiredPlaybackActions(original)) return original;
+        return buildPlaybackState(original.getState(), Math.max(0, original.getPosition()), original.getPlaybackSpeed());
+    }
+
+    private boolean hasRequiredPlaybackActions(PlaybackState state) {
+        if (state == null) return false;
+        if ((state.getActions() & SUPPORTED_ACTIONS) != SUPPORTED_ACTIONS) return false;
+        boolean hasLike = false;
+        boolean hasClose = false;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            for (PlaybackState.CustomAction action : state.getCustomActions()) {
+                if (CUSTOM_ACTION_LIKE.equals(action.getAction())) hasLike = true;
+                else if (CUSTOM_ACTION_CLOSE.equals(action.getAction())) hasClose = true;
+                if (hasLike && hasClose) return true;
+            }
+        }
+        return false;
+    }
+
+    private PlaybackState buildPlaybackState(int state, long position, float speed) {
+        PlaybackState.Builder builder = new PlaybackState.Builder();
+        builder.setState(state, position, speed);
+        builder.setActions(SUPPORTED_ACTIONS);
+        int likeIconRes = isLiked ? android.R.drawable.star_on : android.R.drawable.star_off;
+        builder.addCustomAction(new PlaybackState.CustomAction.Builder(CUSTOM_ACTION_LIKE, isLiked ? "Unlike" : "Like", likeIconRes).build());
+        builder.addCustomAction(new PlaybackState.CustomAction.Builder(CUSTOM_ACTION_CLOSE, "Close", android.R.drawable.ic_menu_close_clear_cancel).build());
+        return builder.build();
+    }
+
+    private void registerAudioDeviceCallback() {
+        if (audioDeviceCallbackRegistered || audioManager == null) return;
+        checkPrivateAudioDevice();
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            audioManager.registerAudioDeviceCallback(new AudioDeviceCallback() {
+                @Override
+                public void onAudioDevicesAdded(AudioDeviceInfo[] addedDevices) {
+                    boolean addedPrivate = false;
+                    for (AudioDeviceInfo device : addedDevices) {
+                        if (isPrivateAudioDevice(device.getType())) { currentPrivateDeviceIds.add(device.getId()); addedPrivate = true; }
+                    }
+                    if (addedPrivate) { hasPrivateAudioDevice = true; L.d(TAG, "Private audio device added"); }
+                }
+                @Override
+                public void onAudioDevicesRemoved(AudioDeviceInfo[] removedDevices) {
+                    boolean removedPrivate = false;
+                    for (AudioDeviceInfo device : removedDevices) { if (currentPrivateDeviceIds.remove(device.getId())) removedPrivate = true; }
+                    if (removedPrivate) {
+                        hasPrivateAudioDevice = !currentPrivateDeviceIds.isEmpty();
+                        L.d(TAG, "Private audio device removed, remaining: " + currentPrivateDeviceIds.size());
+                        if (!hasPrivateAudioDevice && isPlaying) { L.d(TAG, "No private audio device, pausing playback"); pausePlayback(); }
+                    }
+                }
+            }, mainHandler);
+            audioDeviceCallbackRegistered = true;
+            L.d(TAG, "AudioDeviceCallback registered");
         }
     }
+
+    private void checkPrivateAudioDevice() {
+        if (audioManager == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.M) { hasPrivateAudioDevice = true; return; }
+        AudioDeviceInfo[] devices = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS);
+        currentPrivateDeviceIds.clear();
+        hasPrivateAudioDevice = false;
+        for (AudioDeviceInfo device : devices) { if (isPrivateAudioDevice(device.getType())) { currentPrivateDeviceIds.add(device.getId()); hasPrivateAudioDevice = true; } }
+        L.d(TAG, "Initial private audio devices: " + currentPrivateDeviceIds.size());
+    }
+
+    private boolean isPrivateAudioDevice(int type) {
+        switch (type) {
+            case AudioDeviceInfo.TYPE_WIRED_HEADSET:
+            case AudioDeviceInfo.TYPE_WIRED_HEADPHONES:
+            case AudioDeviceInfo.TYPE_BLUETOOTH_A2DP:
+            case AudioDeviceInfo.TYPE_BLUETOOTH_SCO:
+            case AudioDeviceInfo.TYPE_USB_HEADSET:
+            case AudioDeviceInfo.TYPE_USB_DEVICE:
+            case AudioDeviceInfo.TYPE_HEARING_AID:
+            case AudioDeviceInfo.TYPE_DOCK:
+            case AudioDeviceInfo.TYPE_LINE_ANALOG:
+            case AudioDeviceInfo.TYPE_HDMI:
+            case AudioDeviceInfo.TYPE_AUX_LINE:
+            case AudioDeviceInfo.TYPE_USB_ACCESSORY:
+                return true;
+            default: return false;
+        }
+    }
+
+    private void pausePlayback() { try { if (originalCallback != null) originalCallback.onPause(); } catch (Exception e) { L.e(TAG, "pausePlayback error: " + e.getMessage()); } }
+    private void cancelNotification() { if (notificationManager != null) notificationManager.cancel(NOTIFICATION_ID); }
 }

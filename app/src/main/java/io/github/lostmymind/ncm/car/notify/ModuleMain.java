@@ -9,6 +9,7 @@ import android.app.PendingIntent;
 import android.content.Context;
 import android.content.Intent;
 import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.drawable.Icon;
 import android.media.AudioDeviceCallback;
 import android.media.AudioDeviceInfo;
@@ -23,7 +24,6 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
-import android.util.Log;
 
 import java.lang.reflect.Method;
 import java.util.HashSet;
@@ -35,7 +35,6 @@ import io.github.libxposed.api.XposedModuleInterface;
 
 public class ModuleMain extends XposedModule {
 
-    private static final boolean DEBUG = false;
     private static final String TAG = "NeteaseMediaNotify";
     private static final String TARGET_PACKAGE = "com.netease.cloudmusic.iot";
     private static final String CHANNEL_ID = "netease_media_playback";
@@ -51,10 +50,8 @@ public class ModuleMain extends XposedModule {
     private static final int REQUEST_CLOSE = 5;
     private static final long SUPPORTED_ACTIONS = PlaybackState.ACTION_PLAY | PlaybackState.ACTION_PAUSE | PlaybackState.ACTION_PLAY_PAUSE | PlaybackState.ACTION_SKIP_TO_PREVIOUS | PlaybackState.ACTION_SKIP_TO_NEXT | PlaybackState.ACTION_STOP | PlaybackState.ACTION_SEEK_TO | PlaybackState.ACTION_SET_RATING;
     private static final int DEBOUNCE_DELAY_MS = 100;
-    private static final int LIKE_VERIFY_DELAY_MS = 800;
-    private static final int LIKE_COOLDOWN_MS = 1500;
-    private static final int ALBUM_ART_SIZE = 256;
-    private static final long PLAYBACK_STATE_THROTTLE_MS = 200;
+    private static final int ALBUM_ART_SIZE = 160;
+    private static final long PLAYBACK_STATE_THROTTLE_MS = 1000;
     private Context appContext;
     private NotificationManager notificationManager;
     private MediaSessionManager mediaSessionManager;
@@ -77,11 +74,10 @@ public class ModuleMain extends XposedModule {
     private boolean lastIsPlaying = false;
     private boolean lastIsLiked = false;
     private Runnable debounceRunnable;
-    private Runnable likeVerifyRunnable;
-    private long lastLikeVerifyTime = 0;
     private long lastLocalLikeUpdateTime = 0;  // 鏈湴鏀惰棌鐘舵€佹洿鏂版椂闂?
     private static final long LOCAL_STATE_PRIORITY_MS = 2000;  // 鏈湴鐘舵€佷紭鍏堟椂闂寸獥鍙?
     private long lastPlaybackStateUpdateTime = 0;
+    private String currentAlbumArtKey = "";
     private boolean hasPrivateAudioDevice = false;
     private boolean audioDeviceCallbackRegistered = false;
     private Set<Integer> currentPrivateDeviceIds = new HashSet<>();
@@ -101,13 +97,12 @@ public class ModuleMain extends XposedModule {
     private boolean pendingIntentsInitialized = false;
     private android.content.BroadcastReceiver mediaControlReceiver;
 
-    private void logDebug(String msg) { if (DEBUG) Log.d(TAG, msg); }
-    private void logError(String msg) { if (DEBUG) Log.e(TAG, msg); }
+    private static final int NOTIFICATION_UPDATE_DEBOUNCE_MS = 400;
 
     @Override
     public void onPackageLoaded(XposedModuleInterface.PackageLoadedParam param) {
         if (!TARGET_PACKAGE.equals(param.getPackageName())) return;
-        logDebug("Module loaded, starting hooks");
+        L.d(TAG, "Module loaded, starting hooks");
         try {
             Method attachMethod = Application.class.getDeclaredMethod("attach", Context.class);
             hook(attachMethod).intercept(new ApplicationAttachHooker());
@@ -123,7 +118,7 @@ public class ModuleMain extends XposedModule {
             hook(setMetadataMethod).intercept(new MediaSessionSetMetadataHooker());
             Method setPlaybackStateMethod = MediaSession.class.getDeclaredMethod("setPlaybackState", PlaybackState.class);
             hook(setPlaybackStateMethod).intercept(new MediaSessionSetPlaybackStateHooker());
-        } catch (Exception e) { logError("Hook failed: " + e.getMessage()); }
+        } catch (Exception e) { L.e(TAG, "Hook failed: " + e.getMessage()); }
     }
 
     public class ApplicationAttachHooker implements XposedInterface.Hooker {
@@ -149,7 +144,7 @@ public class ModuleMain extends XposedModule {
         public Object intercept(XposedInterface.Chain chain) throws Throwable {
             chain.proceed();
             targetMediaSession = (MediaSession) chain.getThisObject();
-            logDebug("MediaSession captured via constructor 1");
+            L.d(TAG, "MediaSession captured via constructor 1");
             return null;
         }
     }
@@ -159,7 +154,7 @@ public class ModuleMain extends XposedModule {
         public Object intercept(XposedInterface.Chain chain) throws Throwable {
             chain.proceed();
             targetMediaSession = (MediaSession) chain.getThisObject();
-            logDebug("MediaSession captured via constructor 2");
+            L.d(TAG, "MediaSession captured via constructor 2");
             return null;
         }
     }
@@ -203,9 +198,10 @@ public class ModuleMain extends XposedModule {
                 long now = System.currentTimeMillis();
                 // 鏈湴鐘舵€佷紭鍏堬細鍦ㄦ湰鍦板垰淇敼鏀惰棌鐘舵€佸悗锛屽拷鐣ョ郴缁熷洖鍐?
                 if (now - lastLocalLikeUpdateTime < LOCAL_STATE_PRIORITY_MS) {
-                    logDebug("Local like state priority in callback, skip system update");
-                } else if (now - lastLikeVerifyTime > LIKE_COOLDOWN_MS) {
+                    L.d(TAG, "Local like state priority in callback, skip system update");
+                } else {
                     isLiked = rating.hasHeart();
+                    updateLikePendingIntent();
                     scheduleDebouncedUpdate();
                 }
             }
@@ -273,7 +269,7 @@ public class ModuleMain extends XposedModule {
 
     private void initIcons() {
         if (iconsInitialized) return;
-        logDebug("Loading icons from drawable resources");
+        L.d(TAG, "Loading icons from drawable resources");
         try {
             Context moduleContext = appContext.createPackageContext("io.github.lostmymind.ncm.car.notify", Context.CONTEXT_IGNORE_SECURITY);
             int prevId = moduleContext.getResources().getIdentifier("ic_skip_previous", "drawable", "io.github.lostmymind.ncm.car.notify");
@@ -283,15 +279,25 @@ public class ModuleMain extends XposedModule {
             int likeFilledId = moduleContext.getResources().getIdentifier("ic_favorite", "drawable", "io.github.lostmymind.ncm.car.notify");
             int likeBorderId = moduleContext.getResources().getIdentifier("ic_favorite_border", "drawable", "io.github.lostmymind.ncm.car.notify");
             int closeId = moduleContext.getResources().getIdentifier("ic_close", "drawable", "io.github.lostmymind.ncm.car.notify");
-            if (prevId != 0) iconPrev = Icon.createWithResource(moduleContext, prevId);
-            if (playId != 0) iconPlay = Icon.createWithResource(moduleContext, playId);
-            if (pauseId != 0) iconPause = Icon.createWithResource(moduleContext, pauseId);
-            if (nextId != 0) iconNext = Icon.createWithResource(moduleContext, nextId);
-            if (likeFilledId != 0) iconLikeFilled = Icon.createWithResource(moduleContext, likeFilledId);
-            if (likeBorderId != 0) iconLikeBorder = Icon.createWithResource(moduleContext, likeBorderId);
-            if (closeId != 0) iconClose = Icon.createWithResource(moduleContext, closeId);
-        } catch (Exception e) { logError("initIcons error: " + e.getMessage()); }
+            if (prevId != 0) iconPrev = loadBitmapIcon(moduleContext, prevId);
+            if (playId != 0) iconPlay = loadBitmapIcon(moduleContext, playId);
+            if (pauseId != 0) iconPause = loadBitmapIcon(moduleContext, pauseId);
+            if (nextId != 0) iconNext = loadBitmapIcon(moduleContext, nextId);
+            if (likeFilledId != 0) iconLikeFilled = loadBitmapIcon(moduleContext, likeFilledId);
+            if (likeBorderId != 0) iconLikeBorder = loadBitmapIcon(moduleContext, likeBorderId);
+            if (closeId != 0) iconClose = loadBitmapIcon(moduleContext, closeId);
+        } catch (Exception e) { L.e(TAG, "initIcons error: " + e.getMessage()); }
         iconsInitialized = true;
+    }
+
+    private Icon loadBitmapIcon(Context moduleContext, int resId) {
+        try {
+            Bitmap bitmap = BitmapFactory.decodeResource(moduleContext.getResources(), resId);
+            if (bitmap != null) return Icon.createWithBitmap(bitmap);
+        } catch (Exception e) {
+            L.e(TAG, "loadBitmapIcon error: " + e.getMessage());
+        }
+        return null;
     }
 
 
@@ -335,7 +341,7 @@ public class ModuleMain extends XposedModule {
                 notificationManager.createNotificationChannel(channel);
             }
             registerAudioDeviceCallback();
-        } catch (Exception e) { logError("initNotificationSystem error: " + e.getMessage()); }
+        } catch (Exception e) { L.e(TAG, "initNotificationSystem error: " + e.getMessage()); }
     }
 
     private void setupMediaController() {
@@ -351,7 +357,7 @@ public class ModuleMain extends XposedModule {
                 resetLastState();
                 scheduleDebouncedUpdate();
             }
-        } catch (Exception e) { logError("setupMediaController error: " + e.getMessage()); }
+        } catch (Exception e) { L.e(TAG, "setupMediaController error: " + e.getMessage()); }
     }
 
     private void setupMediaControllerCallback() {
@@ -399,16 +405,28 @@ public class ModuleMain extends XposedModule {
             }
             if (songChanged) {
                 isLiked = false;
-                lastLikeVerifyTime = 0;
-                logDebug("Song changed, reset like status");
+                updateLikePendingIntent();
+                currentAlbumArtKey = "";
+                L.d(TAG, "Song changed, reset like status");
             }
             // 浠?metadata 妫€娴嬫敹钘忕姸鎬?
             checkLikeStatusFromMetadata(metadata);
             if (newTitle != null) currentTitle = newTitle;
             currentArtist = newArtist;
-            if (newAlbumArt != null) currentAlbumArt = scaleBitmap(newAlbumArt, ALBUM_ART_SIZE);
-            else currentAlbumArt = null;
-        } catch (Exception e) { logError("updateMetadataInternal error: " + e.getMessage()); }
+            updateAlbumArtIfNeeded(newAlbumArt, songChanged);
+        } catch (Exception e) { L.e(TAG, "updateMetadataInternal error: " + e.getMessage()); }
+    }
+
+    private void updateAlbumArtIfNeeded(Bitmap newAlbumArt, boolean songChanged) {
+        String desiredKey = currentMediaId != null && !currentMediaId.isEmpty() ? currentMediaId : currentTitle + "|" + currentArtist;
+        if (newAlbumArt == null) {
+            currentAlbumArt = null;
+            currentAlbumArtKey = "";
+            return;
+        }
+        if (!songChanged && desiredKey.equals(currentAlbumArtKey) && currentAlbumArt != null) return;
+        currentAlbumArt = scaleBitmap(newAlbumArt, ALBUM_ART_SIZE);
+        currentAlbumArtKey = desiredKey;
     }
 
     private void checkLikeStatusFromMetadata(MediaMetadata metadata) {
@@ -416,7 +434,7 @@ public class ModuleMain extends XposedModule {
             // 鏈湴鐘舵€佷紭鍏堬細鍦ㄦ湰鍦板垰淇敼鏀惰棌鐘舵€佸悗鐨勪竴娈垫椂闂村唴锛屽拷鐣ョ郴缁熷洖鍐?
             long now = System.currentTimeMillis();
             if (now - lastLocalLikeUpdateTime < LOCAL_STATE_PRIORITY_MS) {
-                logDebug("Local like state priority, skip system callback");
+                L.d(TAG, "Local like state priority, skip system callback");
                 return;
             }
 
@@ -424,16 +442,18 @@ public class ModuleMain extends XposedModule {
             Rating userRating = metadata.getRating(MediaMetadata.METADATA_KEY_USER_RATING);
             if (userRating != null && userRating.getRatingStyle() == Rating.RATING_HEART) {
                 isLiked = userRating.hasHeart();
-                logDebug("Like status from USER_RATING: " + isLiked);
+                updateLikePendingIntent();
+                L.d(TAG, "Like status from USER_RATING: " + isLiked);
                 return;
             }
             // 鍥為€€妫€鏌?RATING
             Rating rating = metadata.getRating(MediaMetadata.METADATA_KEY_RATING);
             if (rating != null && rating.getRatingStyle() == Rating.RATING_HEART) {
                 isLiked = rating.hasHeart();
-                logDebug("Like status from RATING: " + isLiked);
+                updateLikePendingIntent();
+                L.d(TAG, "Like status from RATING: " + isLiked);
             }
-        } catch (Exception e) { logError("checkLikeStatusFromMetadata error: " + e.getMessage()); }
+        } catch (Exception e) { L.e(TAG, "checkLikeStatusFromMetadata error: " + e.getMessage()); }
     }
 
     private String extractMediaId(MediaMetadata metadata) {
@@ -466,12 +486,12 @@ public class ModuleMain extends XposedModule {
         debounceRunnable = new Runnable() {
             @Override
             public void run() {
-                if (!hasStateChanged()) { logDebug("State unchanged, skip notification update"); return; }
+                if (!hasStateChanged()) { L.d(TAG, "State unchanged, skip notification update"); return; }
                 updateLastState();
                 updateNotificationInternal();
             }
         };
-        mainHandler.postDelayed(debounceRunnable, DEBOUNCE_DELAY_MS);
+        mainHandler.postDelayed(debounceRunnable, NOTIFICATION_UPDATE_DEBOUNCE_MS);
     }
 
     private void updateNotificationInternal() {
@@ -506,7 +526,7 @@ public class ModuleMain extends XposedModule {
                 } catch (Exception ignored) {}
             }
             notificationManager.notify(NOTIFICATION_ID, builder.build());
-        } catch (Exception e) { logError("updateNotificationInternal error: " + e.getMessage()); }
+        } catch (Exception e) { L.e(TAG, "updateNotificationInternal error: " + e.getMessage()); }
     }
 
     @SuppressLint("UnspecifiedRegisterReceiverFlag")
@@ -559,16 +579,18 @@ public class ModuleMain extends XposedModule {
             }
             // 更新本地状态
             isLiked = !isLiked;
-            lastIsLiked = isLiked;
-            
-            // 关键：更新 PlaybackState 来触发刷新
+            lastLocalLikeUpdateTime = System.currentTimeMillis();
+            updateLikePendingIntent();
             updatePlaybackStateAndNotification();
-        } catch (Exception e) { logError("handleLikeAction error: " + e.getMessage()); }
+        } catch (Exception e) { L.e(TAG, "handleLikeAction error: " + e.getMessage()); }
     }
 
     private void updatePlaybackStateAndNotification() {
         try {
-            if (targetMediaSession == null || mediaController == null) return;
+            if (targetMediaSession == null || mediaController == null) {
+                updateNotificationInternal();
+                return;
+            }
             PlaybackState currentState = mediaController.getPlaybackState();
             if (currentState != null) {
                 PlaybackState newState = buildPlaybackState(
@@ -578,27 +600,9 @@ public class ModuleMain extends XposedModule {
                 );
                 targetMediaSession.setPlaybackState(newState);
             }
+            updateLastState();
             updateNotificationInternal();
-        } catch (Exception e) { logError("updatePlaybackStateAndNotification error: " + e.getMessage()); }
-    }
-
-    private void scheduleLikeVerification(final boolean expectedState) {
-        if (mainHandler == null) return;
-        if (likeVerifyRunnable != null) mainHandler.removeCallbacks(likeVerifyRunnable);
-        likeVerifyRunnable = new Runnable() {
-            @Override
-            public void run() {
-                if (isLiked != expectedState) {
-                    logDebug("Like state mismatch after priority window, updating");
-                    isLiked = expectedState;
-                    lastIsLiked = isLiked;
-                    updateLikePendingIntent();
-                    updateNotificationInternal();
-                    logDebug("Like state verified: " + expectedState);
-                }
-            }
-        };
-        mainHandler.postDelayed(likeVerifyRunnable, LOCAL_STATE_PRIORITY_MS + 100);
+        } catch (Exception e) { L.e(TAG, "updatePlaybackStateAndNotification error: " + e.getMessage()); }
     }
 
     private void handleCloseAction() {
@@ -606,7 +610,7 @@ public class ModuleMain extends XposedModule {
             isNotificationClosed = true;
             cancelNotification();
             if (originalCallback != null) originalCallback.onPause();
-        } catch (Exception e) { logError("handleCloseAction error: " + e.getMessage()); }
+        } catch (Exception e) { L.e(TAG, "handleCloseAction error: " + e.getMessage()); }
     }
 
     private void injectInitialPlaybackState() {
@@ -614,12 +618,23 @@ public class ModuleMain extends XposedModule {
     }
 
     private PlaybackState injectPlaybackActionsIfNeeded(PlaybackState original) {
+        if (hasRequiredPlaybackActions(original)) return original;
+        return buildPlaybackState(original.getState(), Math.max(0, original.getPosition()), original.getPlaybackSpeed());
+    }
+
+    private boolean hasRequiredPlaybackActions(PlaybackState state) {
+        if (state == null) return false;
+        if ((state.getActions() & SUPPORTED_ACTIONS) != SUPPORTED_ACTIONS) return false;
+        boolean hasLike = false;
+        boolean hasClose = false;
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-            for (PlaybackState.CustomAction action : original.getCustomActions()) {
-                if (CUSTOM_ACTION_LIKE.equals(action.getAction())) return original;
+            for (PlaybackState.CustomAction action : state.getCustomActions()) {
+                if (CUSTOM_ACTION_LIKE.equals(action.getAction())) hasLike = true;
+                else if (CUSTOM_ACTION_CLOSE.equals(action.getAction())) hasClose = true;
+                if (hasLike && hasClose) return true;
             }
         }
-        return buildPlaybackState(original.getState(), Math.max(0, original.getPosition()), original.getPlaybackSpeed());
+        return false;
     }
 
     private PlaybackState buildPlaybackState(int state, long position, float speed) {
@@ -643,7 +658,7 @@ public class ModuleMain extends XposedModule {
                     for (AudioDeviceInfo device : addedDevices) {
                         if (isPrivateAudioDevice(device.getType())) { currentPrivateDeviceIds.add(device.getId()); addedPrivate = true; }
                     }
-                    if (addedPrivate) { hasPrivateAudioDevice = true; logDebug("Private audio device added"); }
+                    if (addedPrivate) { hasPrivateAudioDevice = true; L.d(TAG, "Private audio device added"); }
                 }
                 @Override
                 public void onAudioDevicesRemoved(AudioDeviceInfo[] removedDevices) {
@@ -651,13 +666,13 @@ public class ModuleMain extends XposedModule {
                     for (AudioDeviceInfo device : removedDevices) { if (currentPrivateDeviceIds.remove(device.getId())) removedPrivate = true; }
                     if (removedPrivate) {
                         hasPrivateAudioDevice = !currentPrivateDeviceIds.isEmpty();
-                        logDebug("Private audio device removed, remaining: " + currentPrivateDeviceIds.size());
-                        if (!hasPrivateAudioDevice && isPlaying) { logDebug("No private audio device, pausing playback"); pausePlayback(); }
+                        L.d(TAG, "Private audio device removed, remaining: " + currentPrivateDeviceIds.size());
+                        if (!hasPrivateAudioDevice && isPlaying) { L.d(TAG, "No private audio device, pausing playback"); pausePlayback(); }
                     }
                 }
             }, mainHandler);
             audioDeviceCallbackRegistered = true;
-            logDebug("AudioDeviceCallback registered");
+            L.d(TAG, "AudioDeviceCallback registered");
         }
     }
 
@@ -667,7 +682,7 @@ public class ModuleMain extends XposedModule {
         currentPrivateDeviceIds.clear();
         hasPrivateAudioDevice = false;
         for (AudioDeviceInfo device : devices) { if (isPrivateAudioDevice(device.getType())) { currentPrivateDeviceIds.add(device.getId()); hasPrivateAudioDevice = true; } }
-        logDebug("Initial private audio devices: " + currentPrivateDeviceIds.size());
+        L.d(TAG, "Initial private audio devices: " + currentPrivateDeviceIds.size());
     }
 
     private boolean isPrivateAudioDevice(int type) {
@@ -689,6 +704,6 @@ public class ModuleMain extends XposedModule {
         }
     }
 
-    private void pausePlayback() { try { if (originalCallback != null) originalCallback.onPause(); } catch (Exception e) { logError("pausePlayback error: " + e.getMessage()); } }
+    private void pausePlayback() { try { if (originalCallback != null) originalCallback.onPause(); } catch (Exception e) { L.e(TAG, "pausePlayback error: " + e.getMessage()); } }
     private void cancelNotification() { if (notificationManager != null) notificationManager.cancel(NOTIFICATION_ID); }
 }

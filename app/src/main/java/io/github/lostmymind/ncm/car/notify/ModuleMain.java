@@ -74,8 +74,8 @@ public class ModuleMain extends XposedModule {
     private boolean lastIsPlaying = false;
     private boolean lastIsLiked = false;
     private Runnable debounceRunnable;
-    private long lastLocalLikeUpdateTime = 0;  // 鏈湴鏀惰棌鐘舵€佹洿鏂版椂闂?
-    private static final long LOCAL_STATE_PRIORITY_MS = 2000;  // 鏈湴鐘舵€佷紭鍏堟椂闂寸獥鍙?
+    private long lastLocalLikeUpdateTime = 0;  // 本地收藏状态更新时间
+    private static final long LOCAL_STATE_PRIORITY_MS = 2000;  // 本地状态优先时间窗口
     private long lastPlaybackStateUpdateTime = 0;
     private String currentAlbumArtKey = "";
     private boolean hasPrivateAudioDevice = false;
@@ -196,7 +196,7 @@ public class ModuleMain extends XposedModule {
         public void onSetRating(Rating rating) {
             if (rating != null && rating.getRatingStyle() == Rating.RATING_HEART) {
                 long now = System.currentTimeMillis();
-                // 鏈湴鐘舵€佷紭鍏堬細鍦ㄦ湰鍦板垰淇敼鏀惰棌鐘舵€佸悗锛屽拷鐣ョ郴缁熷洖鍐?
+                // 本地状态优先：在本地刚修改收藏状态后，忽略系统回写
                 if (now - lastLocalLikeUpdateTime < LOCAL_STATE_PRIORITY_MS) {
                     L.d(TAG, "Local like state priority in callback, skip system update");
                 } else {
@@ -409,7 +409,7 @@ public class ModuleMain extends XposedModule {
                 currentAlbumArtKey = "";
                 L.d(TAG, "Song changed, reset like status");
             }
-            // 浠?metadata 妫€娴嬫敹钘忕姸鎬?
+            // 从 metadata 检测收藏状态
             checkLikeStatusFromMetadata(metadata);
             if (newTitle != null) currentTitle = newTitle;
             currentArtist = newArtist;
@@ -431,14 +431,14 @@ public class ModuleMain extends XposedModule {
 
     private void checkLikeStatusFromMetadata(MediaMetadata metadata) {
         try {
-            // 鏈湴鐘舵€佷紭鍏堬細鍦ㄦ湰鍦板垰淇敼鏀惰棌鐘舵€佸悗鐨勪竴娈垫椂闂村唴锛屽拷鐣ョ郴缁熷洖鍐?
+            // 本地状态优先：在本地刚修改收藏状态后的一段时间内，忽略系统回写
             long now = System.currentTimeMillis();
             if (now - lastLocalLikeUpdateTime < LOCAL_STATE_PRIORITY_MS) {
                 L.d(TAG, "Local like state priority, skip system callback");
                 return;
             }
 
-            // 浼樺厛妫€鏌?USER_RATING
+            // 优先检查 USER_RATING
             Rating userRating = metadata.getRating(MediaMetadata.METADATA_KEY_USER_RATING);
             if (userRating != null && userRating.getRatingStyle() == Rating.RATING_HEART) {
                 isLiked = userRating.hasHeart();
@@ -446,7 +446,7 @@ public class ModuleMain extends XposedModule {
                 L.d(TAG, "Like status from USER_RATING: " + isLiked);
                 return;
             }
-            // 鍥為€€妫€鏌?RATING
+            // 回退检查 RATING
             Rating rating = metadata.getRating(MediaMetadata.METADATA_KEY_RATING);
             if (rating != null && rating.getRatingStyle() == Rating.RATING_HEART) {
                 isLiked = rating.hasHeart();
